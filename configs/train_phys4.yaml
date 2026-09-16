@@ -36,6 +36,7 @@ train:
   direct_power_weight: 0.2
   aux_regression_targets:
     - first_path_power_dbw
+    - total_received_power_dbw
     - k_factor_db
     - delay_spread_ns
     - azimuth_spread_deg

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import re
 import sys
 import warnings
@@ -1159,6 +1160,17 @@ def extract_semantic_observables_from_deepmimo(
         power_dbw = power_dbw[:num_paths_value]
 
     power_linear = np.power(10.0, power_dbw / 10.0) if power_dbw.size else np.zeros(0)
+    total_received_power_dbw = float("nan")
+    if power_dbw.size:
+        # Stable dB-domain sum: 10*log10(sum(10**(path_power_dbw/10))).
+        strongest_power_dbw = float(np.max(power_dbw))
+        relative_power = np.power(
+            10.0,
+            (power_dbw.astype(np.float64) - strongest_power_dbw) / 10.0,
+        )
+        total_received_power_dbw = strongest_power_dbw + 10.0 * math.log10(
+            float(relative_power.sum())
+        )
     delay_spread = compute_delay_spread(delay_s, power_linear)
     angle_power_linear = (
         np.power(10.0, angle_power_dbw / 10.0)
@@ -1184,6 +1196,7 @@ def extract_semantic_observables_from_deepmimo(
         "los_delay": los_delay,
         "los_aoa_az_deg": los_aoa_az_deg,
         "first_path_power_dbw": first_path_power_dbw,
+        "total_received_power_dbw": total_received_power_dbw,
         "first_path_aoa_az_deg": first_path_aoa_az_deg,
         "reflection_count": interaction_counts["reflection"],
         "diffraction_count": interaction_counts["diffraction"],
@@ -1339,6 +1352,7 @@ def preprocess_deepmimo_dataset(
                 los_delay_s=float(observables["los_delay"]),
                 los_aoa_az_deg=float(observables["los_aoa_az_deg"]),
                 first_path_power_dbw=float(observables["first_path_power_dbw"]),
+                total_received_power_dbw=float(observables["total_received_power_dbw"]),
                 first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
                 reflection_count=int(observables["reflection_count"]),
                 diffraction_count=int(observables["diffraction_count"]),

@@ -56,6 +56,7 @@ from scripts.summarize_noise_robustness_by_model_seed import (  # noqa: E402
 
 
 PRIMARY_METRICS = (
+    "delay_spread_mae_ns",
     "first_delay_mae_ns",
     "first_angle_mae_deg",
     "first_power_mae_db",
@@ -205,6 +206,7 @@ def summarize_prediction_metrics(
     )
 
     metric_fields = {
+        "delay_spread_mae_ns": ("delay_spread_ns", None),
         "first_delay_mae_ns": ("first_path_delay_ns", None),
         "first_angle_mae_deg": ("first_path_angle_deg", None),
         "first_power_mae_db": ("first_path_power_dbw", None),

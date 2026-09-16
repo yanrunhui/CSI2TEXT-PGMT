@@ -45,6 +45,7 @@ train:
     - k_factor_db
     - first_path_delay_ns
     - first_path_power_dbw
+    - total_received_power_dbw
   delay_spread_weight: 0.05
   delay_spread_raw_weight: 0.0005
   delay_spread_raw_beta_ns: 20.0

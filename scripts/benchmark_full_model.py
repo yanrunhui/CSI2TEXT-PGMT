@@ -81,11 +81,20 @@ def build_model(checkpoint: dict[str, Any], device: torch.device) -> CSIClip:
         raise ValueError("Full-model checkpoint is missing prototype_keys.")
     token_norm_mode = _infer_token_norm_mode(checkpoint, None)
     tokenizer_word2id = checkpoint.get("tokenizer_word2id", {})
+    input_weight = checkpoint.get("model_state", {}).get(
+        "csi.input_proj.spatial_linear.weight"
+    )
+    if not isinstance(input_weight, torch.Tensor) or input_weight.ndim != 2:
+        raise ValueError(
+            "Full-model checkpoint is missing "
+            "csi.input_proj.spatial_linear.weight; cannot infer CSI token width."
+        )
+    d_token = int(input_weight.shape[1])
     # CaptionTokenizer.next_id is max(id) + 1; evaluate.py then reserves 8 ids.
     vocab_size = max(max(tokenizer_word2id.values(), default=291) + 9, 300)
     model = CSIClip(
         CSIEncoder(
-            d_token=8,
+            d_token=d_token,
             d_model=384,
             d_clip=256,
             token_norm_mode=token_norm_mode,

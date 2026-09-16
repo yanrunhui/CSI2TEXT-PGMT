@@ -129,6 +129,20 @@ def phase_align(cfr: np.ndarray) -> np.ndarray:
     return (cfr * rotation).astype(np.complex64)
 
 
+def compensate_system_delay(
+    cfr: np.ndarray,
+    frequencies_hz: np.ndarray,
+    system_delay_ns: float,
+) -> np.ndarray:
+    """Remove one fixed hardware delay through its CFR linear phase ramp."""
+    if system_delay_ns == 0.0:
+        return cfr.astype(np.complex64, copy=False)
+    correction = np.exp(
+        1j * 2.0 * np.pi * frequencies_hz * (system_delay_ns * 1e-9)
+    )
+    return (cfr * correction[None, :]).astype(np.complex64)
+
+
 def shared_soft_path_mask(
     cir: np.ndarray,
     noise_tail_fraction: float,
@@ -213,6 +227,7 @@ def process_mat(
     cir_denoising: str,
     support_peak_drop_db: float,
     support_noise_margin_db: float,
+    system_delay_ns: float,
 ) -> dict[str, object]:
     with h5py.File(mat_path, "r") as handle:
         if "/CIR/data" not in handle:
@@ -255,11 +270,16 @@ def process_mat(
         raise ValueError(f"Unsupported CIR denoising mode: {cir_denoising}")
 
     sample_rate_hz = info["sampleRateMHz"] * 1e6
-    cfr_raw, frequency_indexes, selected_frequency_hz = frequency_response(
+    cfr_uncalibrated, frequency_indexes, selected_frequency_hz = frequency_response(
         cir_for_fft,
         target_nf=target_nf,
         sample_rate_hz=sample_rate_hz,
         output_bandwidth_hz=output_bandwidth_hz,
+    )
+    cfr_raw = compensate_system_delay(
+        cfr_uncalibrated,
+        frequencies_hz=selected_frequency_hz,
+        system_delay_ns=system_delay_ns,
     )
     cfr_aligned = phase_align(cfr_raw)
     if token_layout == "native_siso":
@@ -278,6 +298,7 @@ def process_mat(
         np.savez_compressed(
             stream,
             cfr_raw=cfr_raw,
+            cfr_before_system_delay_compensation=cfr_uncalibrated,
             cfr_phase_aligned=cfr_aligned,
             tokens=tokens,
             beam_positions=beam_positions,
@@ -295,6 +316,15 @@ def process_mat(
             first_path_delay_uncalibrated_ns=np.asarray(
                 first_path_delay_uncalibrated_ns, dtype=np.float64
             ),
+            first_path_delay_calibrated_ns=np.asarray(
+                first_path_delay_uncalibrated_ns - system_delay_ns,
+                dtype=np.float64,
+            ),
+            first_path_tap_calibrated_float=np.asarray(
+                first_path_tap - system_delay_ns / sample_period_ns,
+                dtype=np.float64,
+            ),
+            system_delay_compensation_ns=np.asarray(system_delay_ns, dtype=np.float64),
             config_key=np.asarray(config_key),
             token_layout=np.asarray(token_layout),
             cir_denoising=np.asarray(cir_denoising),
@@ -319,6 +349,9 @@ def process_mat(
         "noise_floor": noise_floor,
         "first_path_tap": first_path_tap,
         "first_path_delay_uncalibrated_ns": first_path_delay_uncalibrated_ns,
+        "first_path_delay_calibrated_ns": first_path_delay_uncalibrated_ns
+        - system_delay_ns,
+        "system_delay_compensation_ns": system_delay_ns,
         "token_layout": token_layout,
         "d_token": int(tokens.shape[2]),
         "cir_denoising": cir_denoising,
@@ -378,6 +411,15 @@ def parse_args() -> argparse.Namespace:
         help="Shared-mask threshold component in dB above the tail noise floor.",
     )
     parser.add_argument(
+        "--system-delay-ns",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed hardware delay removed from every CFR with a linear-phase "
+            "correction. Use only a calibrated common value, never a per-MAT shift."
+        ),
+    )
+    parser.add_argument(
         "--token-layout",
         choices=("native_siso", "legacy_upa_2x2_padded"),
         default="legacy_upa_2x2_padded",
@@ -429,6 +471,7 @@ def main() -> None:
                 cir_denoising=args.cir_denoising,
                 support_peak_drop_db=args.support_peak_drop_db,
                 support_noise_margin_db=args.support_noise_margin_db,
+                system_delay_ns=args.system_delay_ns,
             )
             print(f"[{index + 1:03d}/{len(rows):03d}] processed: {output_path.name}")
         processed_rows.append({**row, **result})
@@ -444,6 +487,7 @@ def main() -> None:
             "This is only for compatibility with old array checkpoints."
         )
     print(f"CIR denoising: {args.cir_denoising}")
+    print(f"Fixed system-delay compensation: {args.system_delay_ns:g} ns")
 
 
 if __name__ == "__main__":

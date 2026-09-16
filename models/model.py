@@ -820,7 +820,7 @@ class CSIClip(nn.Module):
         semantic_num_classes: int | None = None,
         embed_dim: int = 256,
         temperature: float = 0.07,
-        num_physics_targets: int = 10,
+        num_physics_targets: int = 11,
         attribute_num_classes: dict[str, int] | None = None,
         use_power_branch: bool = False,
         first_path_power_mode: str = "residual",
@@ -948,6 +948,13 @@ class CSIClip(nn.Module):
         self.first_path_power_index = 5
         self.first_path_angle_sin_index = 6
         self.first_path_angle_cos_index = 7
+        # Keep the original ten target indices stable; total power is appended.
+        self.total_received_power_index = 10 if num_physics_targets > 10 else None
+        base_physics_target_count = (
+            num_physics_targets - 1
+            if self.total_received_power_index is not None
+            else num_physics_targets
+        )
         self.delay_spread_delta_limit = 0.25
         self.delay_spread_fusion_scale = 0.02
         self.first_path_power_delta_limit = 0.5
@@ -962,7 +969,7 @@ class CSIClip(nn.Module):
             nn.BatchNorm1d(embed_dim, eps=1e-12, momentum=None),
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, num_physics_targets),
+            nn.Linear(hidden_dim, base_physics_target_count),
         )
         self.first_path_power_head = nn.Sequential(
             nn.BatchNorm1d(self.power_context_dim, eps=1e-12, momentum=None),
@@ -976,6 +983,15 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        self.total_received_power_head = None
+        if self.total_received_power_index is not None:
+            total_power_context_dim = embed_dim + 32
+            self.total_received_power_head = nn.Sequential(
+                nn.LayerNorm(total_power_context_dim),
+                nn.Linear(total_power_context_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1),
+            )
         self.delay_spread_head = nn.Sequential(
             nn.BatchNorm1d(self.delay_profile_context_dim, eps=1e-12, momentum=None),
             nn.Linear(self.delay_profile_context_dim, hidden_dim),
@@ -1189,6 +1205,11 @@ class CSIClip(nn.Module):
             *self.reflection_count_classifier.modules(),
             *self.reflection_count_regression_head.modules(),
             *self.reflection_path_count_regression_head.modules(),
+            *(
+                self.total_received_power_head.modules()
+                if self.total_received_power_head is not None
+                else ()
+            ),
         ):
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=1e-3)
@@ -1500,6 +1521,13 @@ class CSIClip(nn.Module):
     ) -> dict[str, torch.Tensor]:
         physics_features = self.encode_shared_physics_token(csi_features)
         base = self.physics_head(physics_features)
+        if self.total_received_power_index is not None:
+            # Preserve the legacy 10-output physics head for checkpoint transfer;
+            # the dedicated total-power head fills this appended placeholder below.
+            base = torch.cat(
+                [base, torch.zeros_like(base[:, :1])],
+                dim=-1,
+            )
         if self.use_delay_spread_head:
             base = base.clone()
             base[:, self.delay_spread_index] = 0.0
@@ -1581,6 +1609,15 @@ class CSIClip(nn.Module):
         else:
             raw_power_context = power_context["raw_power_context"]
             delay_profile_stats = power_context["delay_profile_stats"]
+        total_received_power_prediction = torch.zeros(
+            base.shape[0],
+            device=base.device,
+            dtype=base.dtype,
+        )
+        if self.total_received_power_head is not None:
+            total_received_power_prediction = self.total_received_power_head(
+                torch.cat([physics_features, raw_power_context], dim=-1)
+            ).squeeze(-1)
         interaction_count_input = torch.cat(
             [
                 physics_features,
@@ -1621,6 +1658,8 @@ class CSIClip(nn.Module):
             )
             final[:, self.first_path_angle_sin_index] = first_path_angle_sincos[:, 0]
             final[:, self.first_path_angle_cos_index] = first_path_angle_sincos[:, 1]
+            if self.total_received_power_index is not None:
+                final[:, self.total_received_power_index] = total_received_power_prediction
             return {
                 "base": base,
                 "enhanced_first_path_power": base[:, self.first_path_power_index],
@@ -1651,6 +1690,7 @@ class CSIClip(nn.Module):
                 "first_path_power_bin_position": first_path_power_bin_position,
                 "k_factor_strong_bin_logits": k_factor_strong_bin_logits,
                 "k_factor_strong_position": k_factor_strong_position,
+                "total_received_power_prediction": total_received_power_prediction,
                 "final": final,
             }
         enhanced_input = torch.cat(
@@ -1716,6 +1756,8 @@ class CSIClip(nn.Module):
         )
         final[:, self.first_path_angle_sin_index] = first_path_angle_sincos[:, 0]
         final[:, self.first_path_angle_cos_index] = first_path_angle_sincos[:, 1]
+        if self.total_received_power_index is not None:
+            final[:, self.total_received_power_index] = total_received_power_prediction
         return {
             "base": base,
             "enhanced_first_path_power": enhanced_first_path_power,
@@ -1746,6 +1788,7 @@ class CSIClip(nn.Module):
             "first_path_power_bin_position": first_path_power_bin_position,
             "k_factor_strong_bin_logits": k_factor_strong_bin_logits,
             "k_factor_strong_position": k_factor_strong_position,
+            "total_received_power_prediction": total_received_power_prediction,
             "final": final,
         }
 

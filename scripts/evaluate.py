@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import sys
 from collections import Counter
@@ -1026,6 +1027,7 @@ def evaluate(
     attribute_binary_thresholds: dict[str, float] | None = None,
     physical_caption_examples: int = 3,
     save_signal_descriptions_path: str | None = None,
+    save_regression_pairs_path: str | None = None,
     signal_description_correction: str = "bounds",
     verbose_diagnostics: bool = False,
 ) -> None:
@@ -1740,7 +1742,10 @@ def evaluate(
         physics_predictions=physics_predictions,
         physics_raw_targets=physics_raw_targets,
         physics_masks=physics_masks,
-        metrics=(("k_factor_db", "k_factor_db_MAE"),),
+        metrics=(
+            ("k_factor_db", "k_factor_db_MAE"),
+            ("total_received_power_dbw", "total_received_power_dbw_MAE"),
+        ),
     )
     _print_k_factor_diagnostics(
         physics_predictions=physics_predictions,
@@ -1843,6 +1848,18 @@ def evaluate(
             save_signal_descriptions_path,
             signal_description_payload,
         )
+    if save_regression_pairs_path is not None:
+        regression_pairs_payload = _build_regression_pairs_payload(
+            samples=samples,
+            physics_predictions=physics_predictions,
+            first_path_delay_predictions=first_path_delay_context_predictions,
+            physics_raw_targets=physics_raw_targets,
+            physics_masks=physics_masks,
+            semantic_keys=all_semantic_keys,
+            data_path=data_path,
+            checkpoint_path=checkpoint_path,
+        )
+        _save_regression_pairs(save_regression_pairs_path, regression_pairs_payload)
     if verbose_diagnostics and text_mode in ("instance", "multipositive"):
         _print_semantic_retrieval_metrics(
             "csi_to_instance_text_semantic",
@@ -2276,6 +2293,7 @@ def _print_physics_regression_metrics(
         "n_paths": "n_paths_MAE",
         "azimuth_spread_deg": "azimuth_spread_MAE",
         "k_factor_db": "k_factor_db_MAE",
+        "total_received_power_dbw": "total_received_power_dbw_MAE",
     }
     hidden_names = {
         "delay_spread_ns",
@@ -3035,6 +3053,170 @@ def _save_signal_description_payload(path: str, payload: dict) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
     print(f"saved_signal_descriptions={output_path}")
+
+
+REGRESSION_PAIR_METRICS = (
+    "first_path_delay_ns",
+    "first_path_angle_deg",
+    "first_path_power_dbw",
+    "total_received_power_dbw",
+    "k_factor_db",
+)
+
+
+def _angle_degrees_from_sincos(values: torch.Tensor) -> torch.Tensor:
+    """Convert [..., (sin, cos)] vectors to angles in [-180, 180] degrees."""
+    return torch.rad2deg(torch.atan2(values[..., 0], values[..., 1]))
+
+
+def _build_regression_pairs_payload(
+    *,
+    samples,
+    physics_predictions: torch.Tensor,
+    first_path_delay_predictions: torch.Tensor,
+    physics_raw_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    data_path: str,
+    checkpoint_path: str | None,
+) -> dict:
+    sample_count = int(physics_predictions.shape[0])
+    if not (
+        len(samples)
+        == len(semantic_keys)
+        == int(physics_raw_targets.shape[0])
+        == int(physics_masks.shape[0])
+        == int(first_path_delay_predictions.shape[0])
+        == sample_count
+    ):
+        raise ValueError(
+            "Cannot save regression pairs because sample, prediction, target, "
+            "mask, and semantic-key counts differ."
+        )
+
+    raw_predictions = _physics_raw_predictions(physics_predictions).float().cpu()
+    raw_targets = physics_raw_targets.float().cpu()
+    masks = physics_masks.bool().cpu()
+    first_path_delay_predictions = first_path_delay_predictions.float().cpu()
+
+    delay_idx = _physics_target_index("first_path_delay_ns")
+    power_idx = _physics_target_index("first_path_power_dbw")
+    total_power_idx = _physics_target_index("total_received_power_dbw")
+    k_factor_idx = _physics_target_index("k_factor_db")
+    angle_sin_idx = _physics_target_index("first_path_aoa_az_sin")
+    angle_cos_idx = _physics_target_index("first_path_aoa_az_cos")
+
+    delay_prediction = (
+        first_path_delay_predictions * PHYSICS_TARGET_SCALES[delay_idx]
+        + PHYSICS_TARGET_OFFSETS[delay_idx]
+    )
+    angle_prediction = _angle_degrees_from_sincos(
+        raw_predictions[:, [angle_sin_idx, angle_cos_idx]]
+    )
+    angle_ground_truth = _angle_degrees_from_sincos(
+        raw_targets[:, [angle_sin_idx, angle_cos_idx]]
+    )
+
+    predictions = {
+        "first_path_delay_ns": delay_prediction,
+        "first_path_angle_deg": angle_prediction,
+        "first_path_power_dbw": raw_predictions[:, power_idx],
+        "total_received_power_dbw": raw_predictions[:, total_power_idx],
+        "k_factor_db": raw_predictions[:, k_factor_idx],
+    }
+    ground_truth = {
+        "first_path_delay_ns": raw_targets[:, delay_idx],
+        "first_path_angle_deg": angle_ground_truth,
+        "first_path_power_dbw": raw_targets[:, power_idx],
+        "total_received_power_dbw": raw_targets[:, total_power_idx],
+        "k_factor_db": raw_targets[:, k_factor_idx],
+    }
+    valid_masks = {
+        "first_path_delay_ns": masks[:, delay_idx]
+        & torch.isfinite(raw_targets[:, delay_idx]),
+        "first_path_angle_deg": masks[:, angle_sin_idx]
+        & masks[:, angle_cos_idx]
+        & torch.isfinite(raw_targets[:, angle_sin_idx])
+        & torch.isfinite(raw_targets[:, angle_cos_idx]),
+        "first_path_power_dbw": masks[:, power_idx]
+        & torch.isfinite(raw_targets[:, power_idx]),
+        "total_received_power_dbw": masks[:, total_power_idx]
+        & torch.isfinite(raw_targets[:, total_power_idx]),
+        "k_factor_db": masks[:, k_factor_idx]
+        & torch.isfinite(raw_targets[:, k_factor_idx]),
+    }
+    ground_truth = {
+        metric: torch.where(
+            valid_masks[metric],
+            values,
+            torch.full_like(values, float("nan")),
+        )
+        for metric, values in ground_truth.items()
+    }
+
+    return {
+        "format_version": 1,
+        "data_path": str(data_path),
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "sample_count": sample_count,
+        "metric_names": REGRESSION_PAIR_METRICS,
+        "sample_index": torch.arange(sample_count, dtype=torch.long),
+        "group_ids": [str(getattr(sample, "group_id", "")) for sample in samples],
+        "config_keys": [str(getattr(sample, "config_key", "")) for sample in samples],
+        "los_status": [str(key.los_status) for key in semantic_keys],
+        "predictions": predictions,
+        "ground_truth": ground_truth,
+        "valid_masks": valid_masks,
+        "prediction_sources": {
+            "first_path_delay_ns": "first_path_delay_context (matches first_path_delay_context_MAE)",
+            "first_path_angle_deg": "final first-path sin/cos head converted with atan2(sin, cos)",
+            "first_path_power_dbw": "final physics output after first-path-power gate handling",
+            "total_received_power_dbw": "dedicated total-received-power head",
+            "k_factor_db": "final physics output",
+        },
+    }
+
+
+def _save_regression_pairs(path: str, payload: dict) -> None:
+    csv_path = Path(path)
+    if csv_path.suffix.lower() != ".csv":
+        raise ValueError("--save-regression-pairs must point to a .csv file.")
+    tensor_path = csv_path.with_suffix(".pt")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = ["sample_index", "group_id", "config_key", "los_status"]
+    for metric in REGRESSION_PAIR_METRICS:
+        fieldnames.extend(
+            [
+                f"{metric}_ground_truth",
+                f"{metric}_prediction",
+                f"{metric}_valid",
+            ]
+        )
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for index in range(payload["sample_count"]):
+            row = {
+                "sample_index": index,
+                "group_id": payload["group_ids"][index],
+                "config_key": payload["config_keys"][index],
+                "los_status": payload["los_status"][index],
+            }
+            for metric in REGRESSION_PAIR_METRICS:
+                row[f"{metric}_ground_truth"] = float(
+                    payload["ground_truth"][metric][index]
+                )
+                row[f"{metric}_prediction"] = float(
+                    payload["predictions"][metric][index]
+                )
+                row[f"{metric}_valid"] = bool(payload["valid_masks"][metric][index])
+            writer.writerow(row)
+
+    torch.save(payload, tensor_path)
+    print(f"saved_regression_pairs_csv={csv_path}")
+    print(f"saved_regression_pairs_pt={tensor_path}")
 
 
 def _print_first_path_power_diagnostics(
@@ -3913,6 +4095,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--save-regression-pairs",
+        help=(
+            "Optional .csv path for per-sample ground-truth/prediction pairs for "
+            "first-path delay, first-path angle, first-path power, total received "
+            "power, and K-factor. "
+            "A lossless .pt payload is saved beside the CSV."
+        ),
+    )
+    parser.add_argument(
         "--signal-description-correction",
         choices=("none", "bounds", "relational"),
         default="bounds",
@@ -3956,6 +4147,7 @@ def main() -> None:
         attribute_binary_thresholds=parse_attribute_binary_thresholds(args.attribute_binary_threshold),
         physical_caption_examples=args.physical_caption_examples,
         save_signal_descriptions_path=args.save_signal_descriptions,
+        save_regression_pairs_path=args.save_regression_pairs,
         signal_description_correction=args.signal_description_correction,
         verbose_diagnostics=args.verbose_diagnostics,
     )

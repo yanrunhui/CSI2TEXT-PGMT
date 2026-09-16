@@ -1947,6 +1947,16 @@ def run_real_pretrain(
             m.get("batch_label_unique_classes", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        total_power_mae_values = [
+            m["total_received_power_mae_db"]
+            for m in epoch_metrics
+            if "total_received_power_mae_db" in m
+        ]
+        mean_total_received_power_mae_db = (
+            sum(total_power_mae_values) / len(total_power_mae_values)
+            if total_power_mae_values
+            else 0.0
+        )
         mean_strong_k_bin_classifier = sum(
             m.get("loss_strong_k_bin_classifier", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
@@ -2411,6 +2421,7 @@ def run_real_pretrain(
             f"first_angle_nlos_mae={mean_first_path_angle_nlos_mae_deg:.2f}deg "
             f"nlos_power_base_mae={mean_nlos_first_path_power_base_mae_db:.2f}dB "
             f"nlos_power_enh_mae={mean_nlos_first_path_power_enhanced_mae_db:.2f}dB "
+            f"total_power_mae={mean_total_received_power_mae_db:.2f}dB "
             f"power_delta_sat={mean_first_path_power_delta_saturation:.4f} "
             f"noise_frac={mean_noise_augmentation_applied:.3f} "
             f"noise_snr={mean_noise_actual_snr_db:.2f}dB "
@@ -2543,6 +2554,7 @@ def run_real_pretrain(
                         "loss_direct_power": mean_direct_power,
                         "nlos_first_path_power_base_mae_db": mean_nlos_first_path_power_base_mae_db,
                         "nlos_first_path_power_enhanced_mae_db": mean_nlos_first_path_power_enhanced_mae_db,
+                        "total_received_power_mae_db": mean_total_received_power_mae_db,
                         "first_path_power_delta_saturation_fraction": mean_first_path_power_delta_saturation,
                         "loss_first_path_delay": mean_first_path_delay,
                         "loss_los_delay": mean_los_delay,

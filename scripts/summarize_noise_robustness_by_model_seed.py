@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 
 PRIMARY_METRICS = (
+    "delay_spread_mae_ns",
     "first_delay_mae_ns",
     "first_angle_mae_deg",
     "first_power_mae_db",

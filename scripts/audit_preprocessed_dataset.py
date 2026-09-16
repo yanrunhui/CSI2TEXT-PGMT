@@ -32,6 +32,7 @@ NUMERIC_FIELDS = (
     "los_delay_s",
     "los_aoa_az_deg",
     "first_path_power_dbw",
+    "total_received_power_dbw",
     "first_path_aoa_az_deg",
     "reflection_count",
     "diffraction_count",

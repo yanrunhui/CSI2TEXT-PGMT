@@ -3,6 +3,7 @@
 torch
 numpy
 scipy
+matplotlib
 pyyaml
 
 # Optional utilities used by the bundled OpenCLIP training code

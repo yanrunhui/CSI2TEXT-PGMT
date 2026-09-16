@@ -18,6 +18,7 @@ PHYSICS_FIELDS = [
     "delay_spread_ns",
     "azimuth_spread_deg",
     "first_path_power_dbw",
+    "total_received_power_dbw",
 ]
 
 

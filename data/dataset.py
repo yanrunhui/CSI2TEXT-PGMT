@@ -39,6 +39,7 @@ PHYSICS_TARGET_NAMES = (
     "first_path_aoa_az_cos",
     "reflection_count",
     "diffraction_count",
+    "total_received_power_dbw",
 )
 
 PHYSICS_AUX_TARGET_ALIASES = {
@@ -48,12 +49,12 @@ PHYSICS_AUX_TARGET_ALIASES = {
 PHYSICS_AUX_TARGET_CHOICES = ("all", *PHYSICS_TARGET_NAMES, *PHYSICS_AUX_TARGET_ALIASES)
 
 PHYSICS_TARGET_SCALES = torch.tensor(
-    [10.0, 200.0, 90.0, 20.0, 3000.0, 30.0, 1.0, 1.0, 10.0, 10.0],
+    [10.0, 200.0, 90.0, 20.0, 3000.0, 30.0, 1.0, 1.0, 10.0, 10.0, 30.0],
     dtype=torch.float32,
 )
 
 PHYSICS_TARGET_OFFSETS = torch.tensor(
-    [0.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 0.0, -100.0],
     dtype=torch.float32,
 )
 
@@ -106,6 +107,7 @@ class PreprocessedSample:
     reflection_path_count: int = 0
     diffraction_path_count: int = 0
     direct_path_count: int = 0
+    total_received_power_dbw: float = math.nan
     delay_power_map: torch.Tensor = field(default_factory=empty_delay_power_map)
     delay_power_profile: torch.Tensor = field(default_factory=empty_delay_power_profile)
     array_type: str = ""
@@ -204,6 +206,7 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
         "reflection_path_count": 0,
         "diffraction_path_count": 0,
         "direct_path_count": 0,
+        "total_received_power_dbw": math.nan,
     }
     for field_name, default_value in defaults.items():
         if not hasattr(sample, field_name):
@@ -284,6 +287,7 @@ def physics_raw_values(sample: PreprocessedSample) -> torch.Tensor:
             math.cos(first_path_aoa_az_rad) if math.isfinite(first_path_aoa_az_rad) else math.nan,
             _finite_or_nan(sample.reflection_count),
             _finite_or_nan(sample.diffraction_count),
+            _finite_or_nan(getattr(sample, "total_received_power_dbw", math.nan)),
         ],
         dtype=torch.float32,
     )
@@ -633,6 +637,7 @@ def build_synthetic_samples(
                 k_factor_db=float(12.0 - (idx % 3) * 5.0),
                 first_path_delay_s=float((idx % 3 + 1) * 800e-9),
                 first_path_power_dbw=float(-80.0 - (idx % 3) * 10.0),
+                total_received_power_dbw=float(-75.0 - (idx % 3) * 10.0),
                 first_path_aoa_az_deg=float((-60.0, 0.0, 60.0)[idx % 3]),
                 reflection_count=idx % 5,
                 diffraction_count=idx % 4,

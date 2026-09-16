@@ -3613,6 +3613,28 @@ class Trainer:
                 first_path_power_delta_saturation_fraction.detach()
             )
         if physics_predictions is not None:
+            if "total_received_power_dbw" in PHYSICS_TARGET_NAMES:
+                total_power_idx = PHYSICS_TARGET_NAMES.index(
+                    "total_received_power_dbw"
+                )
+                total_power_mask = (
+                    batch["physics_target_mask"][:, total_power_idx].bool()
+                )
+                if bool(total_power_mask.any()):
+                    total_power_scale = PHYSICS_TARGET_SCALES[total_power_idx].to(
+                        device=physics_predictions.device,
+                        dtype=physics_predictions.dtype,
+                    )
+                    total_power_error_db = (
+                        physics_predictions[:, total_power_idx]
+                        - batch["physics_targets"][:, total_power_idx]
+                    ).abs() * total_power_scale
+                    metrics["total_received_power_mae_db"] = float(
+                        total_power_error_db[total_power_mask].mean().detach()
+                    )
+                    metrics["total_received_power_valid_count"] = float(
+                        total_power_mask.sum().item()
+                    )
             metrics["k_factor_sample_weight_mean"] = float(
                 self._k_factor_sample_weights(
                     batch["physics_raw_targets"][:, 3],

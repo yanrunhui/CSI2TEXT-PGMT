@@ -92,6 +92,12 @@ TARGET_SPECS = {
         output_dim=1,
         metric_prefix="first_path_power",
     ),
+    "total_received_power": TargetSpec(
+        name="total_received_power",
+        indices=(_target_index("total_received_power_dbw"),),
+        output_dim=1,
+        metric_prefix="total_received_power",
+    ),
 }
 
 BASELINE_MODEL_NAMES = (

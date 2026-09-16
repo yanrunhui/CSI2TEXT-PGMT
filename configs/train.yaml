@@ -124,6 +124,7 @@ train:
   aux_regression_targets:
     - n_paths
     - first_path_power_dbw
+    - total_received_power_dbw
     - k_factor_db
     - azimuth_spread_deg
 

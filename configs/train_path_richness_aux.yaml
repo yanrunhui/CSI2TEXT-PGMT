@@ -32,6 +32,7 @@ train:
     - azimuth_spread_deg
     - first_path_delay_ns
     - first_path_power_dbw
+    - total_received_power_dbw
   multipositive_distance_threshold: 0.25
   multipositive_positive_mode: semantic_and_physics
   min_class_size: 5
