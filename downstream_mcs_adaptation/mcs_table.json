@@ -1,0 +1,28 @@
+{
+  "format": "csi_mcs_uncalibrated_v1",
+  "system": {
+    "transmit_power_dbm": 23.0,
+    "bandwidth_hz": 100000000.0,
+    "noise_figure_db": 7.0,
+    "thermal_noise_density_dbm_hz": -174.0,
+    "target_bler": 0.1,
+    "subcarriers": 128,
+    "streams": 1,
+    "channel_estimation": "perfect",
+    "equalizer": "MMSE",
+    "cp_policy": "long_enough_to_remove_isi"
+  },
+  "effective_channel": {
+    "mode": "best_beam",
+    "description": "Select one DFT beam by maximum average power, then retain its relative per-subcarrier power profile."
+  },
+  "mcs": [
+    {"index": 0, "name": "MCS0", "modulation": "QPSK", "coding_rate": 0.5, "spectral_efficiency": 1.0},
+    {"index": 1, "name": "MCS1", "modulation": "QPSK", "coding_rate": 0.75, "spectral_efficiency": 1.5},
+    {"index": 2, "name": "MCS2", "modulation": "16QAM", "coding_rate": 0.5, "spectral_efficiency": 2.0},
+    {"index": 3, "name": "MCS3", "modulation": "16QAM", "coding_rate": 0.75, "spectral_efficiency": 3.0},
+    {"index": 4, "name": "MCS4", "modulation": "64QAM", "coding_rate": 0.6666666667, "spectral_efficiency": 4.0},
+    {"index": 5, "name": "MCS5", "modulation": "64QAM", "coding_rate": 0.8333333333, "spectral_efficiency": 5.0}
+  ]
+}
+
