@@ -17,6 +17,8 @@
 - `pretrained.py`：从 checkpoint 自动还原 CSI2TEXT-PGMT，并提取 embedding/物理预测；
 - `run_experiment.py`：训练四个模型、early stopping、测试、汇总指标和绘制 CDF。
 - `run_label_efficiency.py`：用嵌套的 1%/5%/10%/25%/100% 位置标签比较 Scratch 与 Scratch + Frozen Physics。
+- `diagnose_test_errors.py`：读取已有测试预测，按 LoS/NLoS 分组统计并列出最大误差链路。
+- `run_llm_baseline.py`：用 DeepSeek-Qwen3-8B、InternLM3-8B 和 Qwen3.5-2B 做连续 CSI soft-prefix 定位 baseline。
 
 ## 1. 准备 100k 定位数据
 
@@ -168,6 +170,90 @@ python -m downstream_localization.run_label_efficiency \
 - `*_best.pt`：各比例按验证集 Median error 选择的最佳 checkpoint；
 - `*_test_predictions.npz`：各比例的最终测试预测。
 
+## 4. LoS/NLoS 与长尾误差诊断
+
+无需重新训练。对于原四模型实验的预测文件，运行：
+
+```bash
+python -m downstream_localization.diagnose_test_errors \
+  --data downstream_localization/artifacts/d2los_50k_localization.pt \
+  --predictions-dir downstream_localization/outputs/d2los_50k_full_seed0 \
+  --top-k 20
+```
+
+如果 `scratch_physics` 的预测单独存放在另一个输出目录，再运行一次：
+
+```bash
+python -m downstream_localization.diagnose_test_errors \
+  --data downstream_localization/artifacts/d2los_50k_localization.pt \
+  --predictions-dir downstream_localization/outputs/scratch_physics_seed23421 \
+  --models scratch_physics \
+  --top-k 20
+```
+
+每次运行都会在预测目录下生成 `diagnostics/`：
+
+- `los_nlos_metrics.csv`：每个模型在全体、LoS、NLoS 上的 Mean、Median、P90、≤5 m、≤10 m，以及 >50 m、>100 m 比例；
+- `tail_composition.csv`：误差最大约 10% 样本中的 NLoS 比例，并与整个测试集的 NLoS 比例比较；
+- `worst_samples.csv`：每个模型误差最大的 20 条链路，含 `map/source/rx` ID、LoS/NLoS、TX 坐标、真实/预测 RX 坐标；
+- `diagnostics.json`：同样信息的机器可读版本。
+
+脚本会确认预测文件中的样本索引与当前数据包的 test split 完全一致，并重新计算 RX 定位误差；若传错数据集或预测文件，将直接报错。查看结果可用：
+
+```bash
+column -s, -t downstream_localization/outputs/d2los_50k_full_seed0/diagnostics/los_nlos_metrics.csv
+column -s, -t downstream_localization/outputs/d2los_50k_full_seed0/diagnostics/tail_composition.csv
+head -n 21 downstream_localization/outputs/d2los_50k_full_seed0/diagnostics/worst_samples.csv
+```
+
+## 5. LLM 定位 baseline
+
+脚本：[run_llm_baseline.py](run_llm_baseline.py)。它不是把 CSI 写成文字让大模型 zero-shot 回答坐标，而是：
+
+```text
+CSI -> 随机初始化 CSIEncoder -> soft-prefix projector -> LLM -> localization head -> (dx, dy)
+```
+
+默认训练策略：
+
+- `deepseek_r1_qwen3_8b`：冻结 8B LLM，只训练 CSIEncoder、soft-prefix projector、readout 和定位输出头；
+- `internlm3_8b`：冻结 8B LLM，只训练 CSIEncoder、soft-prefix projector、readout 和定位输出头；
+- `qwen3_5_2b`：全量微调文本主干，同时训练 CSIEncoder、soft-prefix projector、readout 和定位输出头。
+
+先用 1k/500/500 检查输出是否正常。以下命令会在 tmux 中后台运行，Qwen3.5 用卡 0，DeepSeek 和 InternLM3 用卡 1；两个 8B 都放在卡 1，但建议不要同时跑，避免显存相互挤占。
+
+```bash
+cd /home/yrh/CSI_model/CSI_model
+mkdir -p downstream_localization/outputs/llm_smoke
+
+tmux new-session -d -s loc_qwen35_1k "cd /home/yrh/CSI_model/CSI_model && CUDA_VISIBLE_DEVICES=0 conda run -n csi_qwen35 --no-capture-output python -u -m downstream_localization.run_llm_baseline --data downstream_localization/artifacts/d2los_50k_localization.pt --checkpoint artifacts/ablations_d2los_100k_upa8x8_nf128_los50k_nlos50k/full_multitask/seed_0/checkpoint_last.pt --model qwen3_5_2b --model-path models/Qwen3.5-2B --output-dir downstream_localization/outputs/llm_smoke/qwen35_2b_1k --train-size 1000 --val-size 500 --test-size 500 --batch-size 4 --grad-accum 8 --epochs 1 --patience 1 --quantization none --backbone-training full --gradient-checkpointing --no-save-backbone 2>&1 | tee downstream_localization/outputs/llm_smoke/qwen35_2b_1k.log"
+
+tmux new-session -d -s loc_deepseek_1k "cd /home/yrh/CSI_model/CSI_model && CUDA_VISIBLE_DEVICES=1 conda run -n csi_qwen35 --no-capture-output python -u -m downstream_localization.run_llm_baseline --data downstream_localization/artifacts/d2los_50k_localization.pt --checkpoint artifacts/ablations_d2los_100k_upa8x8_nf128_los50k_nlos50k/full_multitask/seed_0/checkpoint_last.pt --model deepseek_r1_qwen3_8b --model-path models/DeepSeek-R1-0528-Qwen3-8B --output-dir downstream_localization/outputs/llm_smoke/deepseek_qwen3_8b_1k --train-size 1000 --val-size 500 --test-size 500 --batch-size 4 --grad-accum 8 --epochs 1 --patience 1 --backbone-training frozen --quantization 4bit --gradient-checkpointing 2>&1 | tee downstream_localization/outputs/llm_smoke/deepseek_qwen3_8b_1k.log"
+
+tmux new-session -d -s loc_internlm3_1k "cd /home/yrh/CSI_model/CSI_model && CUDA_VISIBLE_DEVICES=1 conda run -n csi_internlm3 --no-capture-output python -u -m downstream_localization.run_llm_baseline --data downstream_localization/artifacts/d2los_50k_localization.pt --checkpoint artifacts/ablations_d2los_100k_upa8x8_nf128_los50k_nlos50k/full_multitask/seed_0/checkpoint_last.pt --model internlm3_8b --model-path models/InternLM3-8B-Instruct --output-dir downstream_localization/outputs/llm_smoke/internlm3_8b_1k --train-size 1000 --val-size 500 --test-size 500 --batch-size 4 --grad-accum 8 --epochs 1 --patience 1 --backbone-training frozen --quantization 4bit --gradient-checkpointing 2>&1 | tee downstream_localization/outputs/llm_smoke/internlm3_8b_1k.log"
+```
+
+查看运行状态：
+
+```bash
+tmux ls
+tmux attach -t loc_qwen35_1k
+tmux attach -t loc_deepseek_1k
+tmux attach -t loc_internlm3_1k
+```
+
+查看 1k smoke 结果：
+
+```bash
+cat downstream_localization/outputs/llm_smoke/qwen35_2b_1k/metrics.json
+cat downstream_localization/outputs/llm_smoke/deepseek_qwen3_8b_1k/metrics.json
+cat downstream_localization/outputs/llm_smoke/internlm3_8b_1k/metrics.json
+```
+
+确认输出正常后，把 `--train-size 1000 --val-size 500 --test-size 500 --epochs 1 --patience 1` 改成 `--train-size 10000 --val-size 5000 --test-size 5000 --epochs 10 --patience 3`，并换一个新的 `--output-dir`，即可做正式 LLM baseline。
+
 ## 依赖和约束
 
 使用原项目环境即可，额外只需要常见的 `numpy`、`matplotlib` 和 `torch`。数据 token 宽度必须与 checkpoint 一致；例如 UPA 8×8、`2×2` patch 对应 `d_token=8`。checkpoint 必须带有同时包含 LoS/NLoS 的 `prototype_keys`，否则无法构造预测的 `p_LoS`，程序会明确报错。
+
+LLM baseline 额外需要对应环境里的 `transformers`、`accelerate`、`bitsandbytes` 和 `safetensors`。Qwen3.5 建议使用 `csi_qwen35` 环境；InternLM3 使用 `csi_internlm3` 环境，并会启用 `trust_remote_code=True` 加载本地模型代码。

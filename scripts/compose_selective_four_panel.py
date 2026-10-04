@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compose the three NLoS selective-prediction plots and the all-metric heatmap."""
+"""Compose the aggregate selective-prediction plots and the all-metric heatmap."""
 
 from pathlib import Path
 
@@ -15,14 +15,41 @@ HEATMAP = Path("/Users/yanrunhui/Downloads/Codex 图像 2026年9月10日 22_32_5
 OUTPUT = ROOT / "tmp/pdfs/full_paper/figures/selective_prediction_four_panel.png"
 
 CELL_W = 1800
-TOP_H = 1500
-BOTTOM_H = 1880
-CANVAS = (2 * CELL_W, TOP_H + BOTTOM_H)
+CELL_H = 1280
+CANVAS = (2 * CELL_W, 2 * CELL_H)
 PADDING = 42
 
 REGULAR_FONT = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
 BOLD_FONT = "/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf"
 CALLOUT_COLOR = (180, 22, 38)
+
+COVERAGES = np.asarray([0.50, 0.60, 0.70, 0.80, 0.90, 1.00])
+UNCERTAINTY_RISK = np.asarray(
+    [
+        [36.9, 39.9, 42.9, 47.8, 58.0, 100.0],
+        [20.7, 31.6, 45.7, 61.2, 77.3, 100.0],
+        [89.8, 90.0, 90.2, 91.6, 94.8, 100.0],
+        [54.5, 61.1, 68.7, 74.9, 82.7, 100.0],
+    ],
+    dtype=float,
+)
+ORACLE_RISK = np.asarray(
+    [
+        [12.6, 16.2, 20.4, 26.1, 36.3, 100.0],
+        [5.0, 8.7, 17.6, 30.5, 51.5, 100.0],
+        [28.3, 35.7, 44.5, 55.4, 70.9, 100.0],
+        [23.8, 29.7, 37.5, 47.8, 64.3, 100.0],
+    ],
+    dtype=float,
+)
+
+METRIC_LABELS = ["First-path delay", "First-path angle", "First-path power", "K-factor"]
+METRIC_STYLES = [
+    ((0, 114, 178), "circle"),
+    ((213, 94, 0), "square"),
+    ((0, 158, 115), "triangle"),
+    ((204, 121, 167), "diamond"),
+]
 
 
 def draw_callout(draw: ImageDraw.ImageDraw, point: tuple[int, int], label_xy: tuple[int, int],
@@ -57,6 +84,47 @@ def draw_callout(draw: ImageDraw.ImageDraw, point: tuple[int, int], label_xy: tu
     )
 
 
+def draw_boxed_arrow(
+    draw: ImageDraw.ImageDraw,
+    point: tuple[int, int],
+    label_xy: tuple[int, int],
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    color: tuple[int, int, int],
+    anchor: str = "la",
+    circle: bool = False,
+) -> None:
+    """Draw a compact boxed annotation with an arrow pointing to a data feature."""
+    left, top = label_xy
+    bounds = draw.multiline_textbbox((left, top), text, font=font, spacing=4, anchor=anchor)
+    pad_x, pad_y = 12, 8
+    draw.rounded_rectangle(
+        (bounds[0] - pad_x, bounds[1] - pad_y, bounds[2] + pad_x, bounds[3] + pad_y),
+        radius=8,
+        fill="white",
+    )
+    draw.multiline_text(label_xy, text, font=font, fill=color, spacing=4, anchor=anchor)
+    start = ((bounds[0] + bounds[2]) // 2, bounds[3] + pad_y)
+    if point[1] < bounds[1]:
+        start = ((bounds[0] + bounds[2]) // 2, bounds[1] - pad_y)
+    draw.line((start, point), fill=color, width=7)
+    angle = math.atan2(point[1] - start[1], point[0] - start[0])
+    arrow_len = 22
+    arrow_half = 10
+    back_x = point[0] - arrow_len * math.cos(angle)
+    back_y = point[1] - arrow_len * math.sin(angle)
+    perp_x = arrow_half * math.sin(angle)
+    perp_y = -arrow_half * math.cos(angle)
+    draw.polygon(
+        [point, (back_x + perp_x, back_y + perp_y), (back_x - perp_x, back_y - perp_y)],
+        fill=color,
+    )
+    if circle:
+        radius = 18
+        draw.ellipse((point[0] - radius, point[1] - radius, point[0] + radius, point[1] + radius),
+                     outline=color, width=7)
+
+
 def enhance_line_panels(image: Image.Image) -> Image.Image:
     """Thicken the colored line work and label the key node in panel (a)."""
     rgb = image.convert("RGB")
@@ -74,7 +142,7 @@ def enhance_line_panels(image: Image.Image) -> Image.Image:
 
     draw = ImageDraw.Draw(enhanced)
     font = ImageFont.truetype(BOLD_FONT, 55)
-    # Panel (a): retaining 80% coverage lowers NLoS delay risk from about 31 to 16.7 ns.
+    # Panel (a): synthetic helper retained for old single-metric diagnostics.
     draw_callout(draw, (950, 652), (590, 465), "20% deferred: -46% MAE", font)
     return enhanced
 
@@ -110,23 +178,13 @@ def build_normalized_error_uncertainty_panel(width: int = 1600, height: int = 11
     cumulative risks yields the MAE within successive uncertainty-percentile
     bins; the plotted curve is the mean over delay, angle, power, and K-factor.
     """
-    cumulative_risk = np.asarray(
-        [
-            [36.9, 39.9, 42.9, 47.8, 58.0, 100.0],
-            [20.7, 31.6, 45.7, 61.2, 77.3, 100.0],
-            [89.8, 90.0, 90.2, 91.6, 94.8, 100.0],
-            [54.5, 61.1, 68.7, 74.9, 82.7, 100.0],
-        ],
-        dtype=float,
-    )
-    coverages = np.asarray([0.50, 0.60, 0.70, 0.80, 0.90, 1.00])
-    bin_risk = np.empty_like(cumulative_risk)
-    bin_risk[:, 0] = cumulative_risk[:, 0]
-    for index in range(1, len(coverages)):
+    bin_risk = np.empty_like(UNCERTAINTY_RISK)
+    bin_risk[:, 0] = UNCERTAINTY_RISK[:, 0]
+    for index in range(1, len(COVERAGES)):
         bin_risk[:, index] = (
-            coverages[index] * cumulative_risk[:, index]
-            - coverages[index - 1] * cumulative_risk[:, index - 1]
-        ) / (coverages[index] - coverages[index - 1])
+            COVERAGES[index] * UNCERTAINTY_RISK[:, index]
+            - COVERAGES[index - 1] * UNCERTAINTY_RISK[:, index - 1]
+        ) / (COVERAGES[index] - COVERAGES[index - 1])
     mean_risk = np.mean(bin_risk, axis=0)
 
     image = Image.new("RGB", (width, height), "white")
@@ -187,6 +245,337 @@ def build_normalized_error_uncertainty_panel(width: int = 1600, height: int = 11
     final_point = points[-1]
     label = f"Top 10%: {mean_risk[-1]:.0f}% error"
     draw_callout(draw, final_point, (900, 225), label, note_font)
+    return image
+
+
+def build_overall_risk_coverage_panel(width: int = 1600, height: int = 1120) -> Image.Image:
+    """Plot cross-metric normalized MAE as grouped bars at selected coverage levels."""
+    coverage_pct = COVERAGES * 100.0
+    uncertainty = np.mean(UNCERTAINTY_RISK, axis=0)
+    oracle = np.mean(ORACLE_RISK, axis=0)
+    random = np.full_like(uncertainty, 100.0)
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = ImageFont.truetype(BOLD_FONT, 62)
+    subtitle_font = ImageFont.truetype(REGULAR_FONT, 40)
+    axis_font = ImageFont.truetype(REGULAR_FONT, 48)
+    tick_font = ImageFont.truetype(REGULAR_FONT, 40)
+    legend_font = ImageFont.truetype(REGULAR_FONT, 36)
+
+    left, right, top, bottom = 190, width - 70, 185, height - 165
+    y_max = 112.0
+
+    draw.text((width / 2, 28), "(a) Overall risk-coverage", font=title_font,
+              fill=(25, 25, 25), anchor="ma")
+    draw.text((width / 2, 100), "Mean normalized MAE across delay, angle, power, and K-factor",
+              font=subtitle_font, fill=(80, 80, 80), anchor="ma")
+
+    def ycoord(value: float) -> float:
+        return bottom - value / y_max * (bottom - top)
+
+    for value in (0, 25, 50, 75, 100):
+        y = ycoord(value)
+        draw.line((left, y, right, y), fill=(218, 222, 228), width=3)
+        draw.text((left - 20, y), str(value), font=tick_font, fill=(55, 55, 55), anchor="rm")
+    draw.line((left, top, left, bottom), fill=(40, 40, 40), width=5)
+    draw.line((left, bottom, right, bottom), fill=(40, 40, 40), width=5)
+
+    colors = [
+        (0, 114, 178),
+        (0, 158, 115),
+        (230, 159, 0),
+    ]
+    series = [
+        ("Ensemble-uncertainty", uncertainty),
+        ("Oracle-ranking", oracle),
+        ("Random-rejection", random),
+    ]
+    group_w = (right - left) / len(coverage_pct)
+    bar_w = group_w * 0.22
+    offsets = [-bar_w * 1.15, 0.0, bar_w * 1.15]
+    for group_index, coverage in enumerate(coverage_pct):
+        center = left + group_w * (group_index + 0.5)
+        for series_index, (_, values) in enumerate(series):
+            value = float(values[group_index])
+            x0 = center + offsets[series_index] - bar_w / 2
+            x1 = center + offsets[series_index] + bar_w / 2
+            y = ycoord(value)
+            draw.rectangle((x0, y, x1, bottom), fill=colors[series_index])
+            draw.rectangle((x0, y, x1, bottom), outline="white", width=3)
+        draw.text((center, bottom + 25), f"{int(coverage)}", font=tick_font,
+                  fill=(45, 45, 45), anchor="ma")
+
+    draw.text(((left + right) / 2, height - 58), "Coverage (%)",
+              font=axis_font, fill=(30, 30, 30), anchor="mm")
+
+    vertical = Image.new("RGBA", (690, 70), (255, 255, 255, 0))
+    vertical_draw = ImageDraw.Draw(vertical)
+    vertical_draw.text((345, 35), "Normalized MAE (%)", font=axis_font,
+                       fill=(30, 30, 30, 255), anchor="mm")
+    vertical = vertical.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+    image.paste(vertical, (30, round((top + bottom - vertical.height) / 2)), vertical)
+
+    legend_x, legend_y = left + 15, top + 12
+    items = [(color, label) for color, (label, _) in zip(colors, series)]
+    legend_box = (
+        legend_x - 18,
+        legend_y - 32,
+        legend_x + 1520,
+        legend_y + 45,
+    )
+    draw.rectangle(legend_box, fill="white")
+    for index, (color, label) in enumerate(items):
+        x = legend_x + index * 500
+        draw.rectangle((x, legend_y - 17, x + 58, legend_y + 17), fill=color)
+        draw.text((x + 76, legend_y - 20), label, font=legend_font, fill=(25, 25, 25))
+
+    note_font = ImageFont.truetype(BOLD_FONT, 40)
+    coverage_index = 3  # 80% retained means the top 20% most uncertain samples are deferred.
+    center = left + group_w * (coverage_index + 0.5)
+    point = (round(center + offsets[0]), round(ycoord(float(uncertainty[coverage_index]))))
+    draw_boxed_arrow(
+        draw,
+        point,
+        (round(center + 95), round(ycoord(float(uncertainty[coverage_index])) - 155)),
+        "Top 20% deferred:\n31% lower MAE",
+        note_font,
+        CALLOUT_COLOR,
+        circle=True,
+    )
+    return image
+
+
+def build_metric_line_panel(
+    values: np.ndarray,
+    title: str,
+    subtitle: str,
+    width: int = 1600,
+    height: int = 1120,
+) -> Image.Image:
+    """Plot one ranking strategy as four per-metric normalized risk-coverage curves."""
+    coverage_pct = COVERAGES * 100.0
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = ImageFont.truetype(BOLD_FONT, 62)
+    subtitle_font = ImageFont.truetype(REGULAR_FONT, 40)
+    axis_font = ImageFont.truetype(REGULAR_FONT, 48)
+    tick_font = ImageFont.truetype(REGULAR_FONT, 40)
+    legend_font = ImageFont.truetype(REGULAR_FONT, 36)
+
+    left, right, top, bottom = 205, width - 95, 275, height - 165
+    y_max = 112.0
+    draw.text((width / 2, 28), title, font=title_font, fill=(25, 25, 25), anchor="ma")
+    draw.text((width / 2, 100), subtitle, font=subtitle_font, fill=(80, 80, 80), anchor="ma")
+
+    legend_x, legend_y = left + 15, 165
+    legend_gap_x = 560
+    legend_gap_y = 48
+    for index, (metric, (color, shape)) in enumerate(zip(METRIC_LABELS, METRIC_STYLES)):
+        x = legend_x + (index % 2) * legend_gap_x
+        y = legend_y + (index // 2) * legend_gap_y
+        draw.line((x, y, x + 68, y), fill=color, width=10)
+        # Use the same marker language as the plotted line.
+        marker_point = (x + 34, y)
+        radius = 13
+        if shape == "circle":
+            draw.ellipse((marker_point[0] - radius, marker_point[1] - radius,
+                          marker_point[0] + radius, marker_point[1] + radius),
+                         fill=color, outline="white", width=3)
+        elif shape == "square":
+            draw.rectangle((marker_point[0] - radius, marker_point[1] - radius,
+                            marker_point[0] + radius, marker_point[1] + radius),
+                           fill=color, outline="white", width=3)
+        elif shape == "triangle":
+            points = [
+                (marker_point[0], marker_point[1] - radius - 2),
+                (marker_point[0] - radius - 2, marker_point[1] + radius),
+                (marker_point[0] + radius + 2, marker_point[1] + radius),
+            ]
+            draw.polygon(points, fill=color)
+            draw.line(points + [points[0]], fill="white", width=3)
+        else:
+            points = [
+                (marker_point[0], marker_point[1] - radius - 2),
+                (marker_point[0] - radius - 2, marker_point[1]),
+                (marker_point[0], marker_point[1] + radius + 2),
+                (marker_point[0] + radius + 2, marker_point[1]),
+            ]
+            draw.polygon(points, fill=color)
+            draw.line(points + [points[0]], fill="white", width=3)
+        draw.text((x + 84, y - 18), metric, font=legend_font, fill=(25, 25, 25))
+
+    def xcoord(value: float) -> float:
+        return left + (value - 50.0) / 50.0 * (right - left)
+
+    def ycoord(value: float) -> float:
+        return bottom - value / y_max * (bottom - top)
+
+    for value in (0, 25, 50, 75, 100):
+        y = ycoord(value)
+        draw.line((left, y, right, y), fill=(218, 222, 228), width=3)
+        draw.text((left - 20, y), str(value), font=tick_font, fill=(55, 55, 55), anchor="rm")
+    baseline_y = ycoord(100.0)
+    draw.line((left, baseline_y, right, baseline_y), fill=(90, 90, 90), width=4)
+    draw.text((right - 8, baseline_y - 18), "Full coverage = 100%",
+              font=subtitle_font, fill=(70, 70, 70), anchor="rs")
+
+    draw.line((left, top, left, bottom), fill=(40, 40, 40), width=5)
+    draw.line((left, bottom, right, bottom), fill=(40, 40, 40), width=5)
+
+    def draw_marker(point: tuple[int, int], color: tuple[int, int, int], shape: str) -> None:
+        x, y = point
+        radius = 15
+        if shape == "circle":
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color, outline="white", width=4)
+        elif shape == "square":
+            draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color, outline="white", width=4)
+        elif shape == "triangle":
+            points = [(x, y - radius - 2), (x - radius - 2, y + radius), (x + radius + 2, y + radius)]
+            draw.polygon(points, fill=color)
+            draw.line(points + [points[0]], fill="white", width=4, joint="curve")
+        else:
+            points = [(x, y - radius - 2), (x - radius - 2, y), (x, y + radius + 2), (x + radius + 2, y)]
+            draw.polygon(points, fill=color)
+            draw.line(points + [points[0]], fill="white", width=4, joint="curve")
+
+    all_points: list[list[tuple[int, int]]] = []
+    for metric_index, (metric, (color, shape)) in enumerate(zip(METRIC_LABELS, METRIC_STYLES)):
+        row = values[metric_index]
+        points = [(round(xcoord(x)), round(ycoord(y))) for x, y in zip(coverage_pct, row)]
+        all_points.append(points)
+        draw.line(points, fill=color, width=12, joint="curve")
+        for point in points:
+            draw_marker(point, color, shape)
+
+    note_font = ImageFont.truetype(BOLD_FONT, 35)
+    note_color = CALLOUT_COLOR
+    if title.startswith("(c)"):
+        draw_boxed_arrow(
+            draw,
+            all_points[2][3],
+            (round(xcoord(56)), round(ycoord(111))),
+            "Power remains\nhardest to reduce",
+            note_font,
+            note_color,
+        )
+    elif title.startswith("(d)"):
+        draw_boxed_arrow(
+            draw,
+            all_points[1][0],
+            (round(xcoord(57)), round(ycoord(88))),
+            "Oracle ranking\nseparates low-risk\nsamples clearly",
+            note_font,
+            note_color,
+        )
+
+    for value in coverage_pct:
+        draw.text((xcoord(value), bottom + 25), f"{int(value)}", font=tick_font,
+                  fill=(45, 45, 45), anchor="ma")
+    draw.text(((left + right) / 2, height - 58), "Coverage (%)",
+              font=axis_font, fill=(30, 30, 30), anchor="mm")
+
+    vertical = Image.new("RGBA", (1040, 70), (255, 255, 255, 0))
+    vertical_draw = ImageDraw.Draw(vertical)
+    vertical_draw.text((520, 35), "Normalized MAE (% of full-coverage MAE)",
+                       font=axis_font, fill=(30, 30, 30, 255), anchor="mm")
+    vertical = vertical.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+    image.paste(vertical, (58, round((top + bottom - vertical.height) / 2)), vertical)
+    return image
+
+
+def build_overall_deferral_panel(width: int = 1600, height: int = 1120) -> Image.Image:
+    """Summarize overall error after deferring the highest-uncertainty bins."""
+    deferred = 100.0 - COVERAGES[::-1] * 100.0
+    uncertainty = np.mean(UNCERTAINTY_RISK, axis=0)[::-1]
+    oracle = np.mean(ORACLE_RISK, axis=0)[::-1]
+    random = np.full_like(uncertainty, 100.0)
+
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    title_font = ImageFont.truetype(BOLD_FONT, 62)
+    subtitle_font = ImageFont.truetype(REGULAR_FONT, 40)
+    axis_font = ImageFont.truetype(REGULAR_FONT, 48)
+    tick_font = ImageFont.truetype(REGULAR_FONT, 40)
+    note_font = ImageFont.truetype(BOLD_FONT, 42)
+    legend_font = ImageFont.truetype(REGULAR_FONT, 36)
+
+    left, right, top, bottom = 185, width - 70, 185, height - 165
+    y_max = 112.0
+    draw.text((width / 2, 28), "(c) Overall deferral effect", font=title_font,
+              fill=(25, 25, 25), anchor="ma")
+    draw.text((width / 2, 100), "Highest-uncertainty samples are deferred first",
+              font=subtitle_font, fill=(80, 80, 80), anchor="ma")
+
+    def xcoord(value: float) -> float:
+        return left + value / 50.0 * (right - left)
+
+    def ycoord(value: float) -> float:
+        return bottom - value / y_max * (bottom - top)
+
+    for value in (0, 25, 50, 75, 100):
+        y = ycoord(value)
+        draw.line((left, y, right, y), fill=(218, 222, 228), width=3)
+        draw.text((left - 20, y), str(value), font=tick_font, fill=(55, 55, 55), anchor="rm")
+    baseline_y = ycoord(100.0)
+    draw.line((left, baseline_y, right, baseline_y), fill=(90, 90, 90), width=4)
+    baseline_label = "No deferral = 100%"
+    baseline_label_xy = (right - 8, baseline_y - 48)
+    baseline_bounds = draw.textbbox(baseline_label_xy, baseline_label, font=subtitle_font, anchor="rs")
+    draw.rectangle((baseline_bounds[0] - 8, baseline_bounds[1] - 6,
+                    baseline_bounds[2] + 8, baseline_bounds[3] + 6), fill="white")
+    draw.text(baseline_label_xy, baseline_label,
+              font=subtitle_font, fill=(70, 70, 70), anchor="rs")
+    draw.line((left, top, left, bottom), fill=(40, 40, 40), width=5)
+    draw.line((left, bottom, right, bottom), fill=(40, 40, 40), width=5)
+
+    def draw_curve(values: np.ndarray, color: tuple[int, int, int], width_px: int) -> list[tuple[int, int]]:
+        points = [(round(xcoord(x)), round(ycoord(y))) for x, y in zip(deferred, values)]
+        draw.line(points, fill=color, width=width_px, joint="curve")
+        for point in points:
+            radius = 14
+            draw.ellipse((point[0] - radius, point[1] - radius,
+                          point[0] + radius, point[1] + radius),
+                         fill=color, outline="white", width=4)
+        return points
+
+    points = draw_curve(uncertainty, (0, 114, 178), 15)
+    draw_curve(random, (230, 159, 0), 9)
+    draw_curve(oracle, (0, 158, 115), 12)
+
+    for value in deferred:
+        draw.text((xcoord(value), bottom + 25), f"{int(value)}", font=tick_font,
+                  fill=(45, 45, 45), anchor="ma")
+    draw.text(((left + right) / 2, height - 58), "Deferred highest-uncertainty samples (%)",
+              font=axis_font, fill=(30, 30, 30), anchor="mm")
+    vertical = Image.new("RGBA", (690, 70), (255, 255, 255, 0))
+    vertical_draw = ImageDraw.Draw(vertical)
+    vertical_draw.text((345, 35), "Normalized MAE (%)", font=axis_font,
+                       fill=(30, 30, 30, 255), anchor="mm")
+    vertical = vertical.rotate(90, expand=True, resample=Image.Resampling.BICUBIC)
+    image.paste(vertical, (30, round((top + bottom - vertical.height) / 2)), vertical)
+
+    # The lower-left region is below both curves; the upper-left covered them.
+    legend_x, legend_y = left + 35, bottom - 175
+    legend_box = (
+        legend_x - 18,
+        legend_y - 32,
+        legend_x + 520,
+        legend_y + 2 * 48 + 35,
+    )
+    draw.rectangle(legend_box, fill="white")
+    for index, (color, label) in enumerate([
+        ((0, 114, 178), "Ensemble uncertainty"),
+        ((230, 159, 0), "Random rejection"),
+        ((0, 158, 115), "Oracle ranking"),
+    ]):
+        y = legend_y + index * 48
+        draw.line((legend_x, y, legend_x + 70, y), fill=color, width=11)
+        draw.text((legend_x + 86, y - 18), label, font=legend_font, fill=(25, 25, 25))
+
+    point_20 = points[2]
+    draw_callout(draw, point_20, (900, 330),
+                 f"20% deferred:\n{uncertainty[2]:.0f}% normalized MAE", note_font)
     return image
 
 
@@ -368,38 +757,27 @@ def build_square_heatmap(width: int, height: int) -> Image.Image:
 
 
 def main() -> None:
-    source = enhance_line_panels(Image.open(SOURCE).convert("RGB"))
-    width, height = source.size
-
-    # The original Figure 7 is a 2+1 layout. Split it into three independent panels.
-    panel_a = trim_white(source.crop((0, 0, width // 2, height // 2)))
-    panel_b = trim_white(build_normalized_error_uncertainty_panel())
-    panel_c_raw = source.crop((width // 5, height // 2, 4 * width // 5, height))
-    panel_c = trim_white(relocate_panel_c_legend(panel_c_raw))
-
-    # Validate that the requested replacement image is present, then rebuild it from
-    # its displayed values so the cells can be truly square rather than bitmap-stretched.
-    with Image.open(HEATMAP) as supplied_heatmap:
-        supplied_heatmap.verify()
-    heat = build_square_heatmap(CELL_W - 2 * PADDING, BOTTOM_H - 2 * PADDING - 105)
-
+    panel_a = build_overall_risk_coverage_panel(width=1600, height=1120)
+    panel_b = build_normalized_error_uncertainty_panel(width=1600, height=1120)
+    panel_c = build_metric_line_panel(
+            UNCERTAINTY_RISK,
+            "(c) Uncertainty ranking",
+            "Per-metric normalized MAE after retaining the least-uncertain samples",
+            width=1600,
+            height=1120,
+    )
+    panel_d = build_metric_line_panel(
+            ORACLE_RISK,
+            "(d) Oracle ranking",
+            "Per-metric normalized MAE under realized-error oracle ordering",
+            width=1600,
+            height=1120,
+    )
     canvas = Image.new("RGB", CANVAS, "white")
-    paste_centered(canvas, panel_a, 0, 0, TOP_H)
-    paste_centered(canvas, panel_b, CELL_W, 0, TOP_H)
-    paste_centered(canvas, panel_c, 0, TOP_H, BOTTOM_H)
-
-    title_height = 105
-    paste_centered(canvas, heat, CELL_W, TOP_H, BOTTOM_H, top_offset=title_height)
-    draw = ImageDraw.Draw(canvas)
-    title_font = ImageFont.truetype(
-        BOLD_FONT, 70
-    )
-    draw.text(
-        (CELL_W + PADDING, TOP_H + 28),
-        "(d) All-sample normalized MAE",
-        fill=(25, 25, 25),
-        font=title_font,
-    )
+    paste_centered(canvas, trim_white(panel_a), 0, 0, CELL_H)
+    paste_centered(canvas, trim_white(panel_b), CELL_W, 0, CELL_H)
+    paste_centered(canvas, trim_white(panel_c), 0, CELL_H, CELL_H)
+    paste_centered(canvas, trim_white(panel_d), CELL_W, CELL_H, CELL_H)
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(OUTPUT, dpi=(300, 300), optimize=True)

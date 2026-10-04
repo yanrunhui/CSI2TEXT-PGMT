@@ -19,6 +19,7 @@ PHYSICS_FIELDS = [
     "azimuth_spread_deg",
     "first_path_power_dbw",
     "total_received_power_dbw",
+    "first_path_aod_az_deg",
 ]
 
 

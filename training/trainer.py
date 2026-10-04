@@ -50,6 +50,8 @@ class TrainConfig:
     attribute_classifier_class_weight: str = "none"
     attribute_classifier_logit_adjustment: float = 0.0
     aux_regression_weight: float = 0.0
+    first_path_aod_weight: float | None = None
+    first_path_aod_nlos_weight: float = 0.0
     aux_regression_indices: tuple[int, ...] | None = None
     k_factor_loss_weights: dict[str, float] | None = None
     strong_k_bin_classifier_weight: float = 0.0
@@ -100,6 +102,10 @@ class TrainConfig:
     first_path_power_use_internal_gate: bool = True
     nlos_enhanced_power_loss: bool = False
     freeze_csi: bool = False
+    freeze_text_encoder: bool = False
+    freeze_prototypes: bool = False
+    # Deprecated compatibility alias for old callers/checkpoints. New code
+    # controls the text encoder and prototype bank independently.
     freeze_text_prototypes: bool = False
     prototype_warmup_epochs: int = 0
     multipositive_distance_threshold: float = 0.25
@@ -1177,7 +1183,7 @@ class Trainer:
         self.model.train()
         if cfg.freeze_csi:
             self.model.csi.eval()
-        if cfg.freeze_text_prototypes:
+        if cfg.freeze_text_encoder or cfg.freeze_text_prototypes:
             self.model.text.eval()
         warmup_active = epoch <= cfg.prototype_warmup_epochs
         effective_csi_to_text_weight = 0.0 if warmup_active else cfg.csi_to_text_weight
@@ -1185,6 +1191,18 @@ class Trainer:
         effective_semantic_classifier_weight = 0.0 if warmup_active else cfg.semantic_classifier_weight
         effective_attribute_classifier_weight = 0.0 if warmup_active else cfg.attribute_classifier_weight
         effective_aux_regression_weight = 0.0 if warmup_active else cfg.aux_regression_weight
+        effective_first_path_aod_weight = (
+            0.0
+            if warmup_active
+            else (
+                cfg.aux_regression_weight
+                if cfg.first_path_aod_weight is None
+                else cfg.first_path_aod_weight
+            )
+        )
+        effective_first_path_aod_nlos_weight = (
+            0.0 if warmup_active else cfg.first_path_aod_nlos_weight
+        )
         effective_strong_k_bin_classifier_weight = (
             0.0 if warmup_active else cfg.strong_k_bin_classifier_weight
         )
@@ -1385,6 +1403,8 @@ class Trainer:
         first_path_angle_count = None
         first_path_angle_nlos_mae_deg = None
         first_path_angle_nlos_count = None
+        first_path_aod_mae_deg = None
+        first_path_aod_count = None
         direct_power_loss_count = None
         direct_power_loss_nlos_fraction = None
         los_first_path_power_base_mae_db = None
@@ -1407,6 +1427,8 @@ class Trainer:
         reflection_path_count_prediction_histogram = None
         if (
             effective_aux_regression_weight > 0
+            or effective_first_path_aod_weight > 0
+            or effective_first_path_aod_nlos_weight > 0
             or effective_strong_k_bin_classifier_weight > 0.0
             or effective_strong_k_position_weight > 0.0
             or effective_first_path_power_bin_classifier_weight > 0.0
@@ -1430,6 +1452,8 @@ class Trainer:
             or effective_los_angle_weight > 0.0
             or effective_first_path_angle_weight > 0.0
             or effective_first_path_angle_nlos_weight > 0.0
+            or effective_first_path_aod_weight > 0.0
+            or effective_first_path_aod_nlos_weight > 0.0
             or effective_reflection_count_classifier_weight > 0.0
             or effective_reflection_count_regression_weight > 0.0
             or effective_reflection_path_count_regression_weight > 0.0
@@ -1442,6 +1466,7 @@ class Trainer:
             first_path_delay_context = None
             los_angle_context = None
             first_path_angle_context = None
+            first_path_aod_context = None
             if hasattr(self.model, "encode_csi_delay_context"):
                 delay_context = self.model.encode_csi_delay_context(
                     batch["tokens"],
@@ -1462,6 +1487,8 @@ class Trainer:
                     or effective_los_angle_weight > 0.0
                     or effective_first_path_angle_weight > 0.0
                     or effective_first_path_angle_nlos_weight > 0.0
+                    or effective_first_path_aod_weight > 0.0
+                    or effective_first_path_aod_nlos_weight > 0.0
                     or noise_augmentation_applied
                 )
                 and hasattr(self.model, "encode_first_path_delay_context")
@@ -1480,6 +1507,8 @@ class Trainer:
                     effective_los_angle_weight > 0.0
                     or effective_first_path_angle_weight > 0.0
                     or effective_first_path_angle_nlos_weight > 0.0
+                    or effective_first_path_aod_weight > 0.0
+                    or effective_first_path_aod_nlos_weight > 0.0
                 )
                 and hasattr(self.model, "encode_los_angle_context")
             ):
@@ -1504,6 +1533,16 @@ class Trainer:
                     batch["token_mask"],
                     subcarrier_spacing=batch.get("subcarrier_spacing"),
                 )
+            if (
+                (effective_first_path_aod_weight > 0.0 or effective_first_path_aod_nlos_weight > 0.0)
+                and hasattr(self.model, "encode_first_path_aod_context")
+            ):
+                first_path_aod_context = self.model.encode_first_path_aod_context(
+                    batch["tokens"],
+                    batch["beam_positions"],
+                    batch["token_mask"],
+                    subcarrier_spacing=batch.get("subcarrier_spacing"),
+                )
             if bool(getattr(self.model, "use_power_branch", False)):
                 power_context = self.model.encode_power_context(
                     batch["tokens"],
@@ -1518,6 +1557,7 @@ class Trainer:
                 first_path_delay_context=first_path_delay_context,
                 los_angle_context=los_angle_context,
                 first_path_angle_context=first_path_angle_context,
+                first_path_aod_context=first_path_aod_context,
             )
             physics_predictions = physics_outputs["final"]
             if cfg.first_path_power_gate_mode == "base":
@@ -2153,10 +2193,77 @@ class Trainer:
                 first_path_power_bin_position_mae = (
                     valid_position_predictions - valid_position_targets
                 ).abs().mean()
-        if physics_predictions is not None and effective_aux_regression_weight > 0:
+        if physics_predictions is not None and (
+            effective_aux_regression_weight > 0
+            or effective_first_path_aod_weight > 0
+            or effective_first_path_aod_nlos_weight > 0
+        ):
+            aod_sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aod_az_sin")
+            aod_cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aod_az_cos")
+            selected_aux_indices = cfg.aux_regression_indices
+            aod_supervision_enabled = (
+                selected_aux_indices is None
+                or (
+                    aod_sin_idx in selected_aux_indices
+                    and aod_cos_idx in selected_aux_indices
+                )
+            )
+            if aod_supervision_enabled and (
+                effective_first_path_aod_weight > 0 or effective_first_path_aod_nlos_weight > 0
+            ):
+                first_path_aod_prediction = physics_predictions[
+                    :, [aod_sin_idx, aod_cos_idx]
+                ]
+                first_path_aod_target = batch["physics_targets"][
+                    :, [aod_sin_idx, aod_cos_idx]
+                ].to(
+                    device=first_path_aod_prediction.device,
+                    dtype=first_path_aod_prediction.dtype,
+                )
+                first_path_aod_mask = (
+                    batch["physics_target_mask"][:, aod_sin_idx].bool()
+                    & batch["physics_target_mask"][:, aod_cos_idx].bool()
+                    & torch.isfinite(first_path_aod_target).all(dim=1)
+                )
+                if bool(first_path_aod_mask.any()):
+                    valid_aod_predictions = torch.nn.functional.normalize(
+                        first_path_aod_prediction[first_path_aod_mask],
+                        dim=-1,
+                        eps=1e-6,
+                    )
+                    valid_aod_targets = torch.nn.functional.normalize(
+                        first_path_aod_target[first_path_aod_mask],
+                        dim=-1,
+                        eps=1e-6,
+                    )
+                    aod_cosine = (
+                        valid_aod_predictions * valid_aod_targets
+                    ).sum(dim=-1).clamp(-1.0, 1.0)
+                    losses["loss_first_path_aod"] = (1.0 - aod_cosine).mean()
+                    nlos_mask = torch.tensor(
+                        [key.los_status != "los" for key in batch["semantic_keys"]],
+                        device=first_path_aod_mask.device,
+                        dtype=torch.bool,
+                    )[first_path_aod_mask]
+                    if bool(nlos_mask.any()) and effective_first_path_aod_nlos_weight > 0:
+                        losses["loss_first_path_aod_nlos"] = (
+                            1.0 - aod_cosine[nlos_mask]
+                        ).mean()
+                    predicted_aod = torch.atan2(
+                        valid_aod_predictions[:, 0], valid_aod_predictions[:, 1]
+                    )
+                    target_aod = torch.atan2(
+                        valid_aod_targets[:, 0], valid_aod_targets[:, 1]
+                    )
+                    aod_error = torch.atan2(
+                        torch.sin(predicted_aod - target_aod),
+                        torch.cos(predicted_aod - target_aod),
+                    ).abs()
+                    first_path_aod_mae_deg = aod_error.mean() * (180.0 / math.pi)
+                    first_path_aod_count = first_path_aod_mask.sum()
             regression_predictions = physics_predictions
             regression_targets = batch["physics_targets"]
-            regression_mask = batch["physics_target_mask"]
+            regression_mask = batch["physics_target_mask"].clone()
             regression_weights = torch.ones_like(regression_targets)
             if cfg.aux_regression_indices:
                 indices = torch.tensor(cfg.aux_regression_indices, device=self.device, dtype=torch.long)
@@ -2178,6 +2285,11 @@ class Trainer:
                         batch["semantic_keys"],
                         cfg,
                     )
+                if aod_supervision_enabled:
+                    for aod_idx in (aod_sin_idx, aod_cos_idx):
+                        regression_mask[
+                            :, cfg.aux_regression_indices.index(aod_idx)
+                        ] = False
             else:
                 regression_weights[:, 3] = self._k_factor_sample_weights(
                     batch["physics_raw_targets"][:, 3],
@@ -2189,6 +2301,9 @@ class Trainer:
                     batch["semantic_keys"],
                     cfg,
                 )
+                if aod_supervision_enabled:
+                    regression_mask[:, aod_sin_idx] = False
+                    regression_mask[:, aod_cos_idx] = False
             regression_errors = torch.nn.functional.smooth_l1_loss(
                 regression_predictions,
                 regression_targets,
@@ -3161,6 +3276,8 @@ class Trainer:
             effective_semantic_classifier_weight * losses.get("loss_semantic_classifier", torch.zeros((), device=self.device)) +
             effective_attribute_classifier_weight * losses.get("loss_attribute_classifier", torch.zeros((), device=self.device)) +
             effective_aux_regression_weight * losses.get("loss_aux_regression", torch.zeros((), device=self.device)) +
+            effective_first_path_aod_weight * losses.get("loss_first_path_aod", torch.zeros((), device=self.device)) +
+            effective_first_path_aod_nlos_weight * losses.get("loss_first_path_aod_nlos", torch.zeros((), device=self.device)) +
             effective_strong_k_bin_classifier_weight * losses.get("loss_strong_k_bin_classifier", torch.zeros((), device=self.device)) +
             effective_strong_k_position_weight * losses.get("loss_strong_k_position", torch.zeros((), device=self.device)) +
             effective_first_path_power_bin_classifier_weight * losses.get("loss_first_path_power_bin_classifier", torch.zeros((), device=self.device)) +
@@ -3249,6 +3366,14 @@ class Trainer:
             cfg.attribute_classifier_logit_adjustment
         )
         metrics["aux_regression_weight"] = float(effective_aux_regression_weight)
+        metrics["first_path_aod_weight"] = float(effective_first_path_aod_weight)
+        metrics["first_path_aod_nlos_weight"] = float(effective_first_path_aod_nlos_weight)
+        if first_path_aod_mae_deg is not None:
+            metrics["first_path_aod_mae_deg"] = float(
+                first_path_aod_mae_deg.detach()
+            )
+        if first_path_aod_count is not None:
+            metrics["first_path_aod_count"] = float(first_path_aod_count.detach())
         metrics["delay_spread_weight"] = float(effective_delay_spread_weight)
         metrics["delay_spread_raw_weight"] = float(effective_delay_spread_raw_weight)
         metrics["delay_spread_raw_beta_ns"] = float(cfg.delay_spread_raw_beta_ns)

@@ -237,6 +237,33 @@ python -u -m downstream_mcs_adaptation.run_experiment \
 默认损失是带训练集类别权重的交叉熵。`--safety-penalty-weight 0` 表示纯交叉熵；
 如需在验证集上研究更保守的选择，可设置一个正值，但选定后不能根据 final test 调参。
 
+## 6. LLM baseline（1k smoke / 10k formal）
+
+先从 300k 功率档样本的既有 train/val/test 内部分层抽样，生成两个互相嵌套的 manifest：
+
+```bash
+python -m downstream_mcs_adaptation.make_llm_subsets \
+  --input downstream_mcs_adaptation/artifacts/d2los_300k_mcs_power_profiles.pt \
+  --output-dir downstream_mcs_adaptation/artifacts/llm_mcs_subsets \
+  --smoke-train 1000 --smoke-val 500 --smoke-test 500 \
+  --formal-train 10000 --formal-val 5000 --formal-test 5000 \
+  --seed 23421
+```
+
+抽样不会重新划分数据，也不会让物理链路跨越原 train/val/test 边界。smoke 样本是
+formal 样本的子集，各 split 内按 7 个 MCS 类别分层。
+
+`run_llm_baseline.py` 使用与 `scratch` 相同的随机可训练 CSI Encoder、5 个原始幅度
+统计量和显式 `tx_power_dbm`，再通过输入投影头将特征映射为 LLM soft prefix，最后由
+分类输出头预测 Outage/MCS0--MCS5。Qwen3.5-2B 使用 `--full-lm` 全量微调文本主干；
+DeepSeek-R1-Qwen3-8B 与 InternLM3-8B 不加该参数，主干冻结并用 4-bit 权重加载，训练
+CSI Encoder、输入投影头、query token 和分类输出头。
+
+该入口独立实现训练、MCS/BLER/Goodput 指标、预测表及混淆矩阵，不导入
+`run_experiment.py`，也不依赖 matplotlib。每个输出目录包含 `metrics.csv`、
+`metrics.json`、`history.csv`、`test_predictions.csv`、`confusion_matrix.csv` 和最佳
+adapter；Qwen 全量微调还会保存 `best_backbone/`。
+
 ## 输出指标
 
 `metrics.csv` 和 `metrics.json` 对每个模型报告：
@@ -254,7 +281,7 @@ python -u -m downstream_mcs_adaptation.run_experiment \
 此外保存逐测试样本 CSV/NPZ、混淆矩阵、最佳 checkpoint 和冻结特征缓存。
 所有最终指标只在哈希拆分出的 final test 5k 上计算。
 
-## 6. 用完整 PHY 抽查快速 oracle 标签
+## 7. 用完整 PHY 抽查快速 oracle 标签
 
 主实验结束后，可从 final test 固定抽取 500 条链路；该步骤不参与门限拟合或调参：
 
@@ -282,7 +309,8 @@ python -m downstream_mcs_adaptation.score_test_validation \
 
 ## 重要边界
 
-本目录负责校准样本选择、EESM/BLER 参数拟合、50k 快速标签生成和三模型训练评估。
+本目录负责校准样本选择、EESM/BLER 参数拟合、快速标签生成，以及常规模型与 LLM
+baseline 的训练评估。
 它不伪装成标准 PHY 编码/译码器；完整 LDPC/Polar 编码、调制、OFDM、加噪声、MMSE
 均衡、软解调和译码必须由服务器上可信的 MATLAB/Sionna/现有仿真器执行，并通过规定
 的 CSV 接口返回真实块错误统计。这一步是论文中 MCS 门限可信性的来源，不能用手填门限

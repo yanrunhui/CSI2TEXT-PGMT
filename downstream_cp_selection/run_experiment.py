@@ -46,12 +46,14 @@ from downstream_cp_selection.pretrained import (  # noqa: E402
 
 MODEL_NAMES = (
     "scratch",
+    "scratch_physics",
     "full_embedding",
     "full_physics",
     "full_physics_finetune",
 )
 DISPLAY_NAMES = {
     "scratch": "From scratch",
+    "scratch_physics": "Scratch + frozen physics",
     "full_embedding": "Full embedding",
     "full_physics": "Full embedding + physics",
     "full_physics_finetune": "Full embedding + physics + partial fine-tuning",
@@ -177,8 +179,12 @@ class ScratchCPModel(nn.Module):
         token_norm_mode: str,
         use_continuous: bool,
         num_classes: int,
+        physics_dim: int = 0,
     ):
         super().__init__()
+        if physics_dim < 0:
+            raise ValueError("physics_dim must be non-negative")
+        self.physics_dim = int(physics_dim)
         self.encoder = CSIEncoder(
             d_token=d_token,
             d_model=384,
@@ -186,16 +192,27 @@ class ScratchCPModel(nn.Module):
             token_norm_mode=token_norm_mode,
             use_continuous_config_encoding=use_continuous,
         )
-        self.head = CPHead(256, num_classes)
+        self.head = CPHead(256 + self.physics_dim, num_classes)
 
     def forward(
         self,
         batch: dict[str, Any],
         frozen_physics: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if frozen_physics is not None:
-            raise ValueError("Scratch model must not receive frozen physics")
-        return self.head(self.encoder(**encoder_kwargs(batch)))
+        embedding = self.encoder(**encoder_kwargs(batch))
+        if self.physics_dim == 0:
+            if frozen_physics is not None:
+                raise ValueError("Plain Scratch model must not receive frozen physics")
+            features = embedding
+        else:
+            expected_shape = (embedding.shape[0], self.physics_dim)
+            if frozen_physics is None or tuple(frozen_physics.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected frozen physics with shape {expected_shape}, got "
+                    f"{None if frozen_physics is None else tuple(frozen_physics.shape)}"
+                )
+            features = torch.cat([embedding, frozen_physics.detach()], dim=-1)
+        return self.head(features)
 
 
 class FullPhysicsFineTuneCPModel(nn.Module):
@@ -415,13 +432,33 @@ def train_scratch(
     args: argparse.Namespace,
     device: torch.device,
     weight: torch.Tensor | None,
+    *,
+    name: str = "scratch",
+    physics_features: torch.Tensor | None = None,
+    physics_feature_order: list[str] | None = None,
 ) -> dict[str, Any]:
     seed_everything(args.seed)
+    physics_feature_order = list(physics_feature_order or [])
+    if physics_features is None:
+        if physics_feature_order:
+            raise ValueError("physics_feature_order was provided without physics features")
+        physics_dim = 0
+    else:
+        expected_shape = (len(corpus.samples), len(physics_feature_order))
+        if len(physics_feature_order) == 0:
+            raise ValueError("Scratch+Physics requires at least one physics feature")
+        if tuple(physics_features.shape) != expected_shape:
+            raise ValueError(
+                f"Frozen physics must have shape {expected_shape}, "
+                f"got {tuple(physics_features.shape)}"
+            )
+        physics_dim = len(physics_feature_order)
     model = ScratchCPModel(
         d_token=model_info["d_token"],
         token_norm_mode=model_info["token_norm_mode"],
         use_continuous=model_info["use_continuous_config_encoding"],
         num_classes=len(corpus.cp_lengths_ns),
+        physics_dim=physics_dim,
     ).to(device)
     train_loader = make_loader(corpus, corpus.split_indices["train"], args, True, 11)
     val_loader = make_loader(corpus, corpus.split_indices["val"], args, False, 12)
@@ -441,11 +478,18 @@ def train_scratch(
         model.train()
         losses = []
         for batch in train_loader:
+            frozen_physics = None
+            if physics_features is not None:
+                frozen_physics = physics_features[batch["indices"]].to(
+                    device, non_blocking=True
+                )
             batch = move_tensor_batch(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=amp):
                 loss = F.cross_entropy(
-                    model(batch), batch["target_class"], weight=device_weight
+                    model(batch, frozen_physics),
+                    batch["target_class"],
+                    weight=device_weight,
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -454,7 +498,13 @@ def train_scratch(
             scaler.update()
             losses.append(float(loss.detach()))
         val_result = evaluate_scratch(
-            model, val_loader, corpus, device, amp, weight
+            model,
+            val_loader,
+            corpus,
+            device,
+            amp,
+            weight,
+            physics_features=physics_features,
         )
         row = {
             "epoch": float(epoch),
@@ -464,7 +514,7 @@ def train_scratch(
         }
         history.append(row)
         print(
-            f"scratch epoch={epoch:03d} loss={row['train_loss']:.6f} "
+            f"{name} epoch={epoch:03d} loss={row['train_loss']:.6f} "
             f"val_loss={row['val_loss']:.6f} val_acc={row['accuracy_pct']:.2f}% "
             f"val_under={row['underprediction_rate_pct']:.2f}%"
         )
@@ -477,7 +527,7 @@ def train_scratch(
             if stale_epochs >= args.patience:
                 break
     if best_state is None:
-        raise RuntimeError("Scratch training did not produce a checkpoint")
+        raise RuntimeError(f"{name} training did not produce a checkpoint")
     model.load_state_dict(best_state)
     torch.save(
         {
@@ -486,11 +536,26 @@ def train_scratch(
             "history": history,
             "cp_lengths_ns": corpus.cp_lengths_ns,
             "class_weights": weight,
+            "uses_frozen_physics": physics_features is not None,
+            "physics_order": physics_feature_order,
+            "physics_source": (
+                "frozen_pretrained_teacher_predictions"
+                if physics_features is not None
+                else None
+            ),
             "args": vars(args),
         },
-        args.output_dir / "scratch_best.pt",
+        args.output_dir / f"{name}_best.pt",
     )
-    return evaluate_scratch(model, test_loader, corpus, device, amp, weight)
+    return evaluate_scratch(
+        model,
+        test_loader,
+        corpus,
+        device,
+        amp,
+        weight,
+        physics_features=physics_features,
+    )
 
 
 def train_full_physics_finetune(
@@ -966,7 +1031,11 @@ def main() -> None:
         physics_training_warnings(dict(checkpoint.get("args", {})))
         if any(
             name in selected
-            for name in ("full_physics", "full_physics_finetune")
+            for name in (
+                "scratch_physics",
+                "full_physics",
+                "full_physics_finetune",
+            )
         )
         else []
     )
@@ -979,7 +1048,10 @@ def main() -> None:
             message for message in checkpoint_warnings if "delay-spread" not in message
         ]
     for message in checkpoint_warnings:
-        warnings.warn(message + "; Full+Physics results must be interpreted cautiously")
+        warnings.warn(
+            message
+            + "; models using frozen predicted physics must be interpreted cautiously"
+        )
 
     print(
         f"device={device} samples={len(corpus.samples)} "
@@ -992,12 +1064,13 @@ def main() -> None:
 
     if "scratch" in selected:
         results["scratch"] = train_scratch(
-            corpus, model_info, args, device, weight
+            corpus, model_info, args, device, weight, name="scratch"
         )
 
     if any(
         name in selected
         for name in (
+            "scratch_physics",
             "full_embedding",
             "full_physics",
             "full_physics_finetune",
@@ -1024,6 +1097,17 @@ def main() -> None:
         if "full_embedding" in selected:
             results["full_embedding"] = train_frozen_head(
                 "full_embedding", embedding, corpus, args, device, weight
+            )
+        if "scratch_physics" in selected:
+            results["scratch_physics"] = train_scratch(
+                corpus,
+                model_info,
+                args,
+                device,
+                weight,
+                name="scratch_physics",
+                physics_features=active_physics,
+                physics_feature_order=active_physics_order,
             )
         if "full_physics" in selected:
             results["full_physics"] = train_frozen_head(

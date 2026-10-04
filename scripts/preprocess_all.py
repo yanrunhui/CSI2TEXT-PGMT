@@ -987,7 +987,16 @@ def load_deepmimo_dataset(
             )
         dataset = dataset[0]
 
-    required_attrs = ("channel", "los", "num_paths", "delay", "aoa_az", "power", "ch_params")
+    required_attrs = (
+        "channel",
+        "los",
+        "num_paths",
+        "delay",
+        "aoa_az",
+        "aod_az",
+        "power",
+        "ch_params",
+    )
     missing = [name for name in required_attrs if not hasattr(dataset, name)]
     if missing:
         raise SystemExit(
@@ -1118,6 +1127,7 @@ def extract_semantic_observables_from_deepmimo(
     num_paths_value: int,
     delay_s: np.ndarray,
     aoa_az_deg: np.ndarray,
+    aod_az_deg: np.ndarray,
     power_dbw: np.ndarray,
     inter_code: np.ndarray,
 ) -> dict[str, float | int | str]:
@@ -1128,6 +1138,7 @@ def extract_semantic_observables_from_deepmimo(
     los_aoa_az_deg = float("nan")
     first_path_power_dbw = float("nan")
     first_path_aoa_az_deg = float("nan")
+    first_path_aod_az_deg = float("nan")
     interaction_counts = {"reflection": 0, "diffraction": 0}
     interaction_path_counts = {
         "direct": 0,
@@ -1141,6 +1152,8 @@ def extract_semantic_observables_from_deepmimo(
         first_path_power_dbw = float(power_dbw[first_idx])
         if np.isfinite(aoa_az_deg[first_idx]):
             first_path_aoa_az_deg = float(aoa_az_deg[first_idx])
+        if np.isfinite(aod_az_deg[first_idx]):
+            first_path_aod_az_deg = float(aod_az_deg[first_idx])
         interaction_counts = _summed_interaction_counts(inter_code, valid)
         interaction_path_counts = _interaction_path_counts(inter_code, valid)
         los_indices = np.where(valid & (inter_code == 0))[0]
@@ -1198,6 +1211,7 @@ def extract_semantic_observables_from_deepmimo(
         "first_path_power_dbw": first_path_power_dbw,
         "total_received_power_dbw": total_received_power_dbw,
         "first_path_aoa_az_deg": first_path_aoa_az_deg,
+        "first_path_aod_az_deg": first_path_aod_az_deg,
         "reflection_count": interaction_counts["reflection"],
         "diffraction_count": interaction_counts["diffraction"],
         "reflection_path_count": interaction_path_counts["reflection"],
@@ -1292,6 +1306,7 @@ def preprocess_deepmimo_dataset(
             num_paths_value=int(dataset.num_paths[idx]),
             delay_s=delay_s,
             aoa_az_deg=np.asarray(dataset.aoa_az[idx]).reshape(-1),
+            aod_az_deg=np.asarray(dataset.aod_az[idx]).reshape(-1),
             power_dbw=power_dbw,
             inter_code=np.asarray(dataset.inter[idx]).reshape(-1),
         )
@@ -1317,6 +1332,7 @@ def preprocess_deepmimo_dataset(
             first_path_delay_s=float(observables["first_path_delay"]),
             first_path_power_dbw=float(observables["first_path_power_dbw"]),
             first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
+            first_path_aod_az_deg=float(observables["first_path_aod_az_deg"]),
             reflection_count=int(observables["reflection_count"]),
             diffraction_count=int(observables["diffraction_count"]),
             config_key=config_key,
@@ -1354,6 +1370,7 @@ def preprocess_deepmimo_dataset(
                 first_path_power_dbw=float(observables["first_path_power_dbw"]),
                 total_received_power_dbw=float(observables["total_received_power_dbw"]),
                 first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
+                first_path_aod_az_deg=float(observables["first_path_aod_az_deg"]),
                 reflection_count=int(observables["reflection_count"]),
                 diffraction_count=int(observables["diffraction_count"]),
                 reflection_path_count=int(observables["reflection_path_count"]),

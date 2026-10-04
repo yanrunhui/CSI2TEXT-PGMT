@@ -89,6 +89,12 @@ def build_pretrained_model(
             any(key.startswith("first_path_angle_context_encoder.") for key in state),
         )
     )
+    use_first_aod_context = bool(
+        args.get(
+            "use_first_path_aod_context_encoder",
+            any(key.startswith("first_path_aod_context_encoder.") for key in state),
+        )
+    )
     use_shared_physics = bool(
         args.get(
             "use_shared_physics_token",
@@ -141,6 +147,7 @@ def build_pretrained_model(
         use_array_invariant_delay_encoder=use_array_invariant,
         use_los_angle_context_encoder=use_los_angle_context,
         use_first_path_angle_context_encoder=use_first_angle_context,
+        use_first_path_aod_context_encoder=use_first_aod_context,
         los_angle_context_token_norm_mode=token_norm_mode,
         use_pdp_latent_aux=use_pdp_aux,
         pdp_latent_dim=int(pdp_out.shape[0]) if pdp_out is not None else 16,
