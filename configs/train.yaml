@@ -21,6 +21,7 @@ train:
   use_delay_specific_encoder: true
   use_los_angle_context_encoder: true
   use_first_path_angle_context_encoder: true
+  use_first_path_aod_context_encoder: true
   use_shared_physics_token: true
   shared_physics_token_residual_scale: 0.5
   warmup_epochs: 5
@@ -31,6 +32,9 @@ train:
   text_prototype_weight: 1.0
   text_mode: prototype
   prototype_warmup_epochs: 0
+  # fixed | adaptive_prototypes | joint. CLI --semantic-anchor-mode overrides this.
+  semantic_anchor_mode: fixed
+  # Legacy alias retained for older checkpoints/scripts.
   freeze_text_prototypes: true
 
   semantic_classifier_weight: 0.5
@@ -46,6 +50,8 @@ train:
   semantic_key_mode: coarse_k
 
   aux_regression_weight: 0.005
+  first_path_aod_weight: 0.02
+  first_path_aod_nlos_weight: 0.01
   k_factor_loss_weights:
     weak: 1.0
     strong_low: 1.0
@@ -127,6 +133,8 @@ train:
     - total_received_power_dbw
     - k_factor_db
     - azimuth_spread_deg
+    # Auxiliary first-arrival direction; this is not an oracle best-beam label.
+    - first_path_aod_az_deg
 
   multipositive_distance_threshold: 0.25
   multipositive_positive_mode: semantic_and_physics

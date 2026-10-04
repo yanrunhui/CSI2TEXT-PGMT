@@ -86,6 +86,16 @@ TARGET_SPECS = {
         metric_prefix="first_path_angle",
         kind="angle",
     ),
+    "first_path_aod": TargetSpec(
+        name="first_path_aod",
+        indices=(
+            _target_index("first_path_aod_az_sin"),
+            _target_index("first_path_aod_az_cos"),
+        ),
+        output_dim=2,
+        metric_prefix="first_path_aod",
+        kind="angle",
+    ),
     "first_path_power": TargetSpec(
         name="first_path_power",
         indices=(_target_index("first_path_power_dbw"),),

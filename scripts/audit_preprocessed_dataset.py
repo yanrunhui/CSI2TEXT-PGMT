@@ -34,6 +34,7 @@ NUMERIC_FIELDS = (
     "first_path_power_dbw",
     "total_received_power_dbw",
     "first_path_aoa_az_deg",
+    "first_path_aod_az_deg",
     "reflection_count",
     "diffraction_count",
     "reflection_path_count",

@@ -820,7 +820,7 @@ class CSIClip(nn.Module):
         semantic_num_classes: int | None = None,
         embed_dim: int = 256,
         temperature: float = 0.07,
-        num_physics_targets: int = 11,
+        num_physics_targets: int = 13,
         attribute_num_classes: dict[str, int] | None = None,
         use_power_branch: bool = False,
         first_path_power_mode: str = "residual",
@@ -832,6 +832,7 @@ class CSIClip(nn.Module):
         use_array_invariant_delay_encoder: bool = False,
         use_los_angle_context_encoder: bool = False,
         use_first_path_angle_context_encoder: bool = False,
+        use_first_path_aod_context_encoder: bool = False,
         los_angle_context_token_norm_mode: str = "std",
         use_pdp_latent_aux: bool = False,
         pdp_latent_dim: int = 16,
@@ -861,10 +862,12 @@ class CSIClip(nn.Module):
         )
         self.use_los_angle_context_encoder = use_los_angle_context_encoder
         self.use_first_path_angle_context_encoder = use_first_path_angle_context_encoder
+        self.use_first_path_aod_context_encoder = use_first_path_aod_context_encoder
         self.use_pdp_latent_aux = use_pdp_latent_aux
         self.freeze_pdp_latent_aux = freeze_pdp_latent_aux
         self.pdp_latent_aux_scale = float(pdp_latent_aux_scale)
         self.use_shared_physics_token = bool(use_shared_physics_token)
+        self.num_physics_targets = int(num_physics_targets)
         self.shared_physics_token_residual_scale = float(shared_physics_token_residual_scale)
         self.csi = csi_encoder
         self.text = text_encoder
@@ -915,6 +918,11 @@ class CSIClip(nn.Module):
             if use_first_path_angle_context_encoder
             else None
         )
+        self.first_path_aod_context_encoder = (
+            CSIFirstPathAngleContextEncoder()
+            if use_first_path_aod_context_encoder
+            else None
+        )
         self.csi_delay_context_dim = CSI_DELAY_CONTEXT_DIM
         self.delay_head_input_dim = embed_dim + self.csi_delay_context_dim
         self.pdp_latent_aux_encoder = None
@@ -948,13 +956,12 @@ class CSIClip(nn.Module):
         self.first_path_power_index = 5
         self.first_path_angle_sin_index = 6
         self.first_path_angle_cos_index = 7
-        # Keep the original ten target indices stable; total power is appended.
+        # Keep the original ten target indices stable. Dedicated heads fill the
+        # appended total-power and first-path-AoD targets.
         self.total_received_power_index = 10 if num_physics_targets > 10 else None
-        base_physics_target_count = (
-            num_physics_targets - 1
-            if self.total_received_power_index is not None
-            else num_physics_targets
-        )
+        self.first_path_aod_sin_index = 11 if num_physics_targets > 12 else None
+        self.first_path_aod_cos_index = 12 if num_physics_targets > 12 else None
+        base_physics_target_count = min(num_physics_targets, 10)
         self.delay_spread_delta_limit = 0.25
         self.delay_spread_fusion_scale = 0.02
         self.first_path_power_delta_limit = 0.5
@@ -1082,6 +1089,22 @@ class CSIClip(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 2),
         )
+        self.first_path_aod_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
+        self.first_path_aod_fusion_head = (
+            nn.Sequential(
+                nn.LayerNorm(self.delay_head_input_dim * 2 + self.csi_delay_context_dim),
+                nn.Linear(self.delay_head_input_dim * 2 + self.csi_delay_context_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2),
+            )
+            if use_first_path_aod_context_encoder
+            else None
+        )
         self.delay_spread_tail_classifier = nn.Sequential(
             nn.LayerNorm(self.delay_head_input_dim),
             nn.Linear(self.delay_head_input_dim, hidden_dim),
@@ -1201,6 +1224,12 @@ class CSIClip(nn.Module):
             *self.first_path_angle_head.modules(),
             *self.first_path_angle_fusion_head.modules(),
             *self.first_path_angle_selector_fusion_head.modules(),
+            *self.first_path_aod_head.modules(),
+            *(
+                self.first_path_aod_fusion_head.modules()
+                if self.first_path_aod_fusion_head is not None
+                else ()
+            ),
             *self.delay_spread_tail_classifier.modules(),
             *self.reflection_count_classifier.modules(),
             *self.reflection_count_regression_head.modules(),
@@ -1419,6 +1448,22 @@ class CSIClip(nn.Module):
             subcarrier_spacing=subcarrier_spacing,
         )
 
+    def encode_first_path_aod_context(
+        self,
+        tokens: torch.Tensor,
+        beam_positions: torch.Tensor,
+        token_mask: torch.Tensor,
+        subcarrier_spacing: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if self.first_path_aod_context_encoder is None:
+            return None
+        return self.first_path_aod_context_encoder(
+            tokens,
+            beam_positions,
+            token_mask,
+            subcarrier_spacing=subcarrier_spacing,
+        )
+
     def _delay_profile_statistics(
         self,
         *,
@@ -1500,6 +1545,7 @@ class CSIClip(nn.Module):
         first_path_delay_context: torch.Tensor | None = None,
         los_angle_context: torch.Tensor | None = None,
         first_path_angle_context: torch.Tensor | None = None,
+        first_path_aod_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.predict_physics_components(
             csi_features,
@@ -1508,6 +1554,7 @@ class CSIClip(nn.Module):
             first_path_delay_context=first_path_delay_context,
             los_angle_context=los_angle_context,
             first_path_angle_context=first_path_angle_context,
+            first_path_aod_context=first_path_aod_context,
         )["final"]
 
     def predict_physics_components(
@@ -1518,14 +1565,16 @@ class CSIClip(nn.Module):
         first_path_delay_context: torch.Tensor | None = None,
         los_angle_context: torch.Tensor | None = None,
         first_path_angle_context: torch.Tensor | None = None,
+        first_path_aod_context: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         physics_features = self.encode_shared_physics_token(csi_features)
         base = self.physics_head(physics_features)
-        if self.total_received_power_index is not None:
-            # Preserve the legacy 10-output physics head for checkpoint transfer;
-            # the dedicated total-power head fills this appended placeholder below.
+        placeholder_count = self.num_physics_targets - base.shape[-1]
+        if placeholder_count > 0:
+            # Preserve the legacy 10-output physics head for checkpoint transfer.
+            # Dedicated heads fill appended placeholders below.
             base = torch.cat(
-                [base, torch.zeros_like(base[:, :1])],
+                [base, base.new_zeros(base.shape[0], placeholder_count)],
                 dim=-1,
             )
         if self.use_delay_spread_head:
@@ -1592,6 +1641,14 @@ class CSIClip(nn.Module):
             first_path_angle_sincos = self.first_path_angle_selector_fusion_head(
                 torch.cat([first_path_angle_input, first_path_angle_context], dim=-1)
             )
+        if self.first_path_aod_fusion_head is not None and first_path_aod_context is not None:
+            first_path_aod_sincos = self.first_path_aod_fusion_head(
+                torch.cat([first_path_angle_input, first_path_aod_context], dim=-1)
+            )
+        else:
+            # Preserve old checkpoints. New checkpoints require the context path
+            # for a supervised AoD prediction; this fallback may be untrained.
+            first_path_aod_sincos = self.first_path_aod_head(physics_features)
         delay_spread_tail_logits = self.delay_spread_tail_classifier(delay_head_input)
         if power_context is None:
             raw_power_context = torch.zeros(
@@ -1660,6 +1717,9 @@ class CSIClip(nn.Module):
             final[:, self.first_path_angle_cos_index] = first_path_angle_sincos[:, 1]
             if self.total_received_power_index is not None:
                 final[:, self.total_received_power_index] = total_received_power_prediction
+            if self.first_path_aod_sin_index is not None:
+                final[:, self.first_path_aod_sin_index] = first_path_aod_sincos[:, 0]
+                final[:, self.first_path_aod_cos_index] = first_path_aod_sincos[:, 1]
             return {
                 "base": base,
                 "enhanced_first_path_power": base[:, self.first_path_power_index],
@@ -1676,6 +1736,7 @@ class CSIClip(nn.Module):
                 "los_delay_context": los_delay_context,
                 "los_angle_sincos": los_angle_sincos,
                 "first_path_angle_sincos": first_path_angle_sincos,
+                "first_path_aod_sincos": first_path_aod_sincos,
                 "enhanced_delay_spread_gate": zeros,
                 "enhanced_delay_spread_delta": zeros,
                 "enhanced_gate": zeros,
@@ -1758,6 +1819,9 @@ class CSIClip(nn.Module):
         final[:, self.first_path_angle_cos_index] = first_path_angle_sincos[:, 1]
         if self.total_received_power_index is not None:
             final[:, self.total_received_power_index] = total_received_power_prediction
+        if self.first_path_aod_sin_index is not None:
+            final[:, self.first_path_aod_sin_index] = first_path_aod_sincos[:, 0]
+            final[:, self.first_path_aod_cos_index] = first_path_aod_sincos[:, 1]
         return {
             "base": base,
             "enhanced_first_path_power": enhanced_first_path_power,
@@ -1774,6 +1838,7 @@ class CSIClip(nn.Module):
             "los_delay_context": los_delay_context,
             "los_angle_sincos": los_angle_sincos,
             "first_path_angle_sincos": first_path_angle_sincos,
+            "first_path_aod_sincos": first_path_aod_sincos,
             "enhanced_delay_spread_gate": delay_spread_gate,
             "enhanced_delay_spread_delta": delay_spread_delta,
             "enhanced_gate": enhanced_gate,

@@ -603,6 +603,16 @@ def _infer_use_first_path_angle_context_encoder(checkpoint: dict | None) -> bool
     return any(key.startswith("first_path_angle_context_encoder.") for key in model_state)
 
 
+def _infer_use_first_path_aod_context_encoder(checkpoint: dict | None) -> bool:
+    if checkpoint is None:
+        return False
+    args = checkpoint.get("args", {})
+    if "use_first_path_aod_context_encoder" in args:
+        return bool(args["use_first_path_aod_context_encoder"])
+    model_state = checkpoint.get("model_state", {})
+    return any(key.startswith("first_path_aod_context_encoder.") for key in model_state)
+
+
 def _checkpoint_has_delay_family_heads(checkpoint: dict | None) -> bool:
     if checkpoint is None:
         return False
@@ -1028,6 +1038,7 @@ def evaluate(
     physical_caption_examples: int = 3,
     save_signal_descriptions_path: str | None = None,
     save_regression_pairs_path: str | None = None,
+    save_prototype_diagnostics_path: str | None = None,
     signal_description_correction: str = "bounds",
     verbose_diagnostics: bool = False,
 ) -> None:
@@ -1074,6 +1085,9 @@ def evaluate(
     use_los_angle_context_encoder = _infer_use_los_angle_context_encoder(checkpoint)
     use_first_path_angle_context_encoder = (
         _infer_use_first_path_angle_context_encoder(checkpoint)
+    )
+    use_first_path_aod_context_encoder = (
+        _infer_use_first_path_aod_context_encoder(checkpoint)
     )
     delay_family_heads_enabled = _checkpoint_has_delay_family_heads(checkpoint)
     attribute_fields = _infer_attribute_fields(checkpoint, attribute_fields_override)
@@ -1279,6 +1293,7 @@ def evaluate(
         use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
         use_shared_physics_token=use_shared_physics_token,
         shared_physics_token_residual_scale=shared_physics_token_residual_scale,
@@ -1372,6 +1387,7 @@ def evaluate(
         first_path_delay_context = None
         los_angle_context = None
         first_path_angle_context = None
+        first_path_aod_context = None
         if hasattr(model, "encode_csi_delay_context"):
             delay_context = model.encode_csi_delay_context(
                 batch["tokens"],
@@ -1405,6 +1421,13 @@ def evaluate(
                 batch["token_mask"],
                 subcarrier_spacing=batch.get("subcarrier_spacing"),
             )
+        if hasattr(model, "encode_first_path_aod_context"):
+            first_path_aod_context = model.encode_first_path_aod_context(
+                batch["tokens"],
+                batch["beam_positions"],
+                batch["token_mask"],
+                subcarrier_spacing=batch.get("subcarrier_spacing"),
+            )
         if use_power_branch:
             power_context = model.encode_power_context(
                 batch["tokens"],
@@ -1419,6 +1442,7 @@ def evaluate(
             first_path_delay_context=first_path_delay_context,
             los_angle_context=los_angle_context,
             first_path_angle_context=first_path_angle_context,
+            first_path_aod_context=first_path_aod_context,
         )
         physics_predictions = physics_outputs["final"]
         all_base_physics_predictions.append(physics_outputs["base"].cpu())
@@ -1507,6 +1531,13 @@ def evaluate(
         normalize=True,
     ).cpu()
     prototype_features = model.encode_prototypes(normalize=True).cpu()
+    _print_and_save_prototype_drift_metrics(
+        prototype_features=prototype_features,
+        final_text_features=prototype_text_features,
+        checkpoint=checkpoint,
+        prototype_keys=prototype_keys,
+        save_path=save_prototype_diagnostics_path,
+    )
     csi_features = torch.cat(all_csi_features, dim=0)
     semantic_logits = torch.cat(all_semantic_logits, dim=0) if all_semantic_logits else None
     attribute_logits = {
@@ -1642,6 +1673,7 @@ def evaluate(
         )
         print(f"use_los_angle_context_encoder={use_los_angle_context_encoder}")
         print(f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder}")
+        print(f"use_first_path_aod_context_encoder={use_first_path_aod_context_encoder}")
         print(f"use_shared_physics_token={use_shared_physics_token}")
         print(f"shared_physics_token_residual_scale={shared_physics_token_residual_scale:.4f}")
         print(f"delay_spread_raw_beta_ns={delay_spread_raw_beta_ns:.4f}")
@@ -1785,6 +1817,13 @@ def evaluate(
         semantic_keys=all_semantic_keys,
         verbose=verbose_diagnostics,
     )
+    _print_first_path_aod_diagnostics(
+        physics_predictions=physics_predictions,
+        physics_targets=physics_targets,
+        physics_masks=physics_masks,
+        semantic_keys=all_semantic_keys,
+        verbose=verbose_diagnostics,
+    )
     _print_interaction_count_head_diagnostics(
         reflection_logits=reflection_count_logits,
         reflection_predictions=reflection_count_predictions,
@@ -1913,6 +1952,115 @@ def _print_retrieval_metrics(prefix: str, logits: torch.Tensor, labels: torch.Te
     print(f"{prefix}_mean_rank={float(target_ranks.float().mean()):.2f}")
 
 
+def _print_and_save_prototype_drift_metrics(
+    *,
+    prototype_features: torch.Tensor,
+    final_text_features: torch.Tensor,
+    checkpoint: dict | None,
+    prototype_keys: list[SemanticKey],
+    save_path: str | None,
+) -> None:
+    """Report prototype drift against the canonical text anchors at train start."""
+    prototypes = F.normalize(prototype_features.float(), dim=-1)
+    final_text = F.normalize(final_text_features.float(), dim=-1)
+    prototype_to_final_text = (prototypes * final_text).sum(dim=-1).clamp(-1.0, 1.0)
+    print(
+        "prototype_to_final_text_cosine_mean="
+        f"{float(prototype_to_final_text.mean()):.6f}"
+    )
+
+    initial_text = None if checkpoint is None else checkpoint.get(
+        "prototype_initial_text_features"
+    )
+    if not isinstance(initial_text, torch.Tensor):
+        print("prototype_initial_text_features_available=0")
+        print("prototype_to_initial_text_cosine_mean=nan")
+        print("prototype_to_initial_text_cosine_min=nan")
+        print("prototype_to_initial_text_cosine_max=nan")
+        print("prototype_drift_Dp=nan")
+        print("final_text_to_initial_text_cosine_mean=nan")
+        return
+    initial_text = initial_text.detach().cpu().float()
+    if tuple(initial_text.shape) != tuple(prototypes.shape):
+        raise ValueError(
+            "checkpoint prototype_initial_text_features shape mismatch: "
+            f"checkpoint={tuple(initial_text.shape)} "
+            f"prototypes={tuple(prototypes.shape)}."
+        )
+    initial_text = F.normalize(initial_text, dim=-1)
+    prototype_to_initial_text = (
+        prototypes * initial_text
+    ).sum(dim=-1).clamp(-1.0, 1.0)
+    final_text_to_initial_text = (
+        final_text * initial_text
+    ).sum(dim=-1).clamp(-1.0, 1.0)
+    drift = 1.0 - prototype_to_initial_text
+
+    print("prototype_initial_text_features_available=1")
+    print(
+        "prototype_to_initial_text_cosine_mean="
+        f"{float(prototype_to_initial_text.mean()):.6f}"
+    )
+    print(
+        "prototype_to_initial_text_cosine_min="
+        f"{float(prototype_to_initial_text.min()):.6f}"
+    )
+    print(
+        "prototype_to_initial_text_cosine_max="
+        f"{float(prototype_to_initial_text.max()):.6f}"
+    )
+    print(f"prototype_drift_Dp={float(drift.mean()):.6f}")
+    print(
+        "final_text_to_initial_text_cosine_mean="
+        f"{float(final_text_to_initial_text.mean()):.6f}"
+    )
+
+    if save_path is None:
+        return
+    output_path = Path(save_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    captions = (
+        checkpoint.get("prototype_captions", [])
+        if checkpoint is not None
+        else []
+    )
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "prototype_index",
+                "semantic_key",
+                "canonical_caption",
+                "prototype_to_initial_text_cosine",
+                "prototype_drift",
+                "prototype_to_final_text_cosine",
+                "final_text_to_initial_text_cosine",
+            ),
+        )
+        writer.writeheader()
+        for index, key in enumerate(prototype_keys):
+            writer.writerow(
+                {
+                    "prototype_index": index,
+                    "semantic_key": str(key),
+                    "canonical_caption": (
+                        captions[index] if index < len(captions) else ""
+                    ),
+                    "prototype_to_initial_text_cosine": float(
+                        prototype_to_initial_text[index]
+                    ),
+                    "prototype_drift": float(drift[index]),
+                    "prototype_to_final_text_cosine": float(
+                        prototype_to_final_text[index]
+                    ),
+                    "final_text_to_initial_text_cosine": float(
+                        final_text_to_initial_text[index]
+                    ),
+                }
+            )
+    print(f"saved_prototype_diagnostics={output_path}")
+
+
 def _safe_pearson(x: torch.Tensor, y: torch.Tensor) -> float:
     if x.numel() < 2:
         return 0.0
@@ -1931,7 +2079,7 @@ def _binary_threshold_metrics(
 ) -> dict[str, float]:
     scores = logits[:, 1] - logits[:, 0]
     if threshold_override is not None:
-        thresholds = torch.tensor([threshold_override], dtype=scores.dtype)
+        thresholds = scores.new_tensor([threshold_override])
     else:
         sorted_scores = torch.sort(scores).values
         if sorted_scores.numel() == 1:
@@ -1946,32 +2094,55 @@ def _binary_threshold_metrics(
                 ]
             )
 
+    # Exact threshold sweep in O(N log N), rather than materializing predictions
+    # for every one of the O(N) thresholds (which made evaluation O(N^2)).
+    sorted_scores, order = torch.sort(scores)
+    sorted_labels = labels[order]
+    prefix_class0 = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long, device=labels.device),
+            (sorted_labels == 0).long().cumsum(dim=0),
+        ]
+    )
+    prefix_class1 = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.long, device=labels.device),
+            (sorted_labels == 1).long().cumsum(dim=0),
+        ]
+    )
+    # The prediction rule is score >= threshold -> class 1, hence samples
+    # strictly below the threshold are predicted as class 0.
+    split_indices = torch.searchsorted(
+        sorted_scores.contiguous(),
+        thresholds.contiguous(),
+        right=False,
+    )
+    class0_count = int((labels == 0).sum().item())
+    class1_count = int((labels == 1).sum().item())
+    class0_correct = prefix_class0[split_indices].float()
+    class1_correct = (
+        class1_count - prefix_class1[split_indices]
+    ).float()
+    class0_acc = (
+        class0_correct / float(class0_count)
+        if class0_count > 0
+        else torch.zeros_like(class0_correct)
+    )
+    class1_acc = (
+        class1_correct / float(class1_count)
+        if class1_count > 0
+        else torch.zeros_like(class1_correct)
+    )
+    macro_top1 = 0.5 * (class0_acc + class1_acc)
+    top1 = (class0_correct + class1_correct) / float(max(labels.numel(), 1))
+    best_index = int(macro_top1.argmax().item())
     best = {
-        "macro_top1": -1.0,
-        "top1": 0.0,
-        "threshold": 0.0,
-        "class0_acc": 0.0,
-        "class1_acc": 0.0,
+        "macro_top1": float(macro_top1[best_index]),
+        "top1": float(top1[best_index]),
+        "threshold": float(thresholds[best_index]),
+        "class0_acc": float(class0_acc[best_index]),
+        "class1_acc": float(class1_acc[best_index]),
     }
-    for threshold in thresholds:
-        predictions = (scores >= threshold).long()
-        class_accs = []
-        for class_idx in (0, 1):
-            mask = labels == class_idx
-            if bool(mask.any()):
-                class_accs.append((predictions[mask] == labels[mask]).float().mean())
-            else:
-                class_accs.append(torch.zeros(()))
-        macro_top1 = float(torch.stack(class_accs).mean())
-        top1 = float((predictions == labels).float().mean())
-        if threshold_override is not None or macro_top1 > best["macro_top1"]:
-            best = {
-                "macro_top1": macro_top1,
-                "top1": top1,
-                "threshold": float(threshold),
-                "class0_acc": float(class_accs[0]),
-                "class1_acc": float(class_accs[1]),
-            }
     best["margin_mean"] = float(scores.mean())
     best["margin_std"] = float(scores.std())
     return best
@@ -2300,6 +2471,8 @@ def _print_physics_regression_metrics(
         "first_path_delay_ns",
         "first_path_aoa_az_sin",
         "first_path_aoa_az_cos",
+        "first_path_aod_az_sin",
+        "first_path_aod_az_cos",
         "first_path_power_dbw",
         "reflection_count",
     }
@@ -2716,6 +2889,50 @@ def _print_first_path_angle_diagnostics(
     )
 
 
+def _print_first_path_aod_diagnostics(
+    physics_predictions: torch.Tensor,
+    physics_targets: torch.Tensor,
+    physics_masks: torch.Tensor,
+    semantic_keys: list[SemanticKey],
+    verbose: bool = False,
+) -> None:
+    sin_idx = PHYSICS_TARGET_NAMES.index("first_path_aod_az_sin")
+    cos_idx = PHYSICS_TARGET_NAMES.index("first_path_aod_az_cos")
+    predictions = physics_predictions[:, [sin_idx, cos_idx]]
+    targets = physics_targets[:, [sin_idx, cos_idx]]
+    mask = (
+        physics_masks[:, sin_idx].bool()
+        & physics_masks[:, cos_idx].bool()
+        & torch.isfinite(targets).all(dim=1)
+    )
+    los_mask = torch.tensor(
+        [key.los_status == "los" for key in semantic_keys],
+        dtype=torch.bool,
+        device=mask.device,
+    )
+    _print_angle_diagnostics(
+        "first_path_aod",
+        predictions=predictions,
+        targets=targets,
+        mask=mask,
+        verbose=verbose,
+    )
+    _print_angle_diagnostics(
+        "first_path_aod_los",
+        predictions=predictions,
+        targets=targets,
+        mask=mask & los_mask,
+        verbose=verbose,
+    )
+    _print_angle_diagnostics(
+        "first_path_aod_nlos",
+        predictions=predictions,
+        targets=targets,
+        mask=mask & ~los_mask,
+        verbose=verbose,
+    )
+
+
 def _strong_k_targets(
     physics_raw_targets: torch.Tensor,
     physics_masks: torch.Tensor,
@@ -3058,6 +3275,7 @@ def _save_signal_description_payload(path: str, payload: dict) -> None:
 REGRESSION_PAIR_METRICS = (
     "first_path_delay_ns",
     "first_path_angle_deg",
+    "first_path_aod_az_deg",
     "first_path_power_dbw",
     "total_received_power_dbw",
     "k_factor_db",
@@ -3105,6 +3323,8 @@ def _build_regression_pairs_payload(
     k_factor_idx = _physics_target_index("k_factor_db")
     angle_sin_idx = _physics_target_index("first_path_aoa_az_sin")
     angle_cos_idx = _physics_target_index("first_path_aoa_az_cos")
+    aod_sin_idx = _physics_target_index("first_path_aod_az_sin")
+    aod_cos_idx = _physics_target_index("first_path_aod_az_cos")
 
     delay_prediction = (
         first_path_delay_predictions * PHYSICS_TARGET_SCALES[delay_idx]
@@ -3116,10 +3336,17 @@ def _build_regression_pairs_payload(
     angle_ground_truth = _angle_degrees_from_sincos(
         raw_targets[:, [angle_sin_idx, angle_cos_idx]]
     )
+    aod_prediction = _angle_degrees_from_sincos(
+        raw_predictions[:, [aod_sin_idx, aod_cos_idx]]
+    )
+    aod_ground_truth = _angle_degrees_from_sincos(
+        raw_targets[:, [aod_sin_idx, aod_cos_idx]]
+    )
 
     predictions = {
         "first_path_delay_ns": delay_prediction,
         "first_path_angle_deg": angle_prediction,
+        "first_path_aod_az_deg": aod_prediction,
         "first_path_power_dbw": raw_predictions[:, power_idx],
         "total_received_power_dbw": raw_predictions[:, total_power_idx],
         "k_factor_db": raw_predictions[:, k_factor_idx],
@@ -3127,6 +3354,7 @@ def _build_regression_pairs_payload(
     ground_truth = {
         "first_path_delay_ns": raw_targets[:, delay_idx],
         "first_path_angle_deg": angle_ground_truth,
+        "first_path_aod_az_deg": aod_ground_truth,
         "first_path_power_dbw": raw_targets[:, power_idx],
         "total_received_power_dbw": raw_targets[:, total_power_idx],
         "k_factor_db": raw_targets[:, k_factor_idx],
@@ -3138,6 +3366,10 @@ def _build_regression_pairs_payload(
         & masks[:, angle_cos_idx]
         & torch.isfinite(raw_targets[:, angle_sin_idx])
         & torch.isfinite(raw_targets[:, angle_cos_idx]),
+        "first_path_aod_az_deg": masks[:, aod_sin_idx]
+        & masks[:, aod_cos_idx]
+        & torch.isfinite(raw_targets[:, aod_sin_idx])
+        & torch.isfinite(raw_targets[:, aod_cos_idx]),
         "first_path_power_dbw": masks[:, power_idx]
         & torch.isfinite(raw_targets[:, power_idx]),
         "total_received_power_dbw": masks[:, total_power_idx]
@@ -3170,6 +3402,7 @@ def _build_regression_pairs_payload(
         "prediction_sources": {
             "first_path_delay_ns": "first_path_delay_context (matches first_path_delay_context_MAE)",
             "first_path_angle_deg": "final first-path sin/cos head converted with atan2(sin, cos)",
+            "first_path_aod_az_deg": "dedicated first-path AoD sin/cos head converted with atan2(sin, cos)",
             "first_path_power_dbw": "final physics output after first-path-power gate handling",
             "total_received_power_dbw": "dedicated total-received-power head",
             "k_factor_db": "final physics output",
@@ -4104,6 +4337,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--save-prototype-diagnostics",
+        help=(
+            "Optional .csv path for per-prototype cosine similarity and drift "
+            "against the canonical text features captured at training start."
+        ),
+    )
+    parser.add_argument(
         "--signal-description-correction",
         choices=("none", "bounds", "relational"),
         default="bounds",
@@ -4148,6 +4388,7 @@ def main() -> None:
         physical_caption_examples=args.physical_caption_examples,
         save_signal_descriptions_path=args.save_signal_descriptions,
         save_regression_pairs_path=args.save_regression_pairs,
+        save_prototype_diagnostics_path=args.save_prototype_diagnostics,
         signal_description_correction=args.signal_description_correction,
         verbose_diagnostics=args.verbose_diagnostics,
     )

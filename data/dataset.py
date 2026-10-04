@@ -40,21 +40,24 @@ PHYSICS_TARGET_NAMES = (
     "reflection_count",
     "diffraction_count",
     "total_received_power_dbw",
+    "first_path_aod_az_sin",
+    "first_path_aod_az_cos",
 )
 
 PHYSICS_AUX_TARGET_ALIASES = {
     "first_path_aoa_az_deg": ("first_path_aoa_az_sin", "first_path_aoa_az_cos"),
+    "first_path_aod_az_deg": ("first_path_aod_az_sin", "first_path_aod_az_cos"),
 }
 
 PHYSICS_AUX_TARGET_CHOICES = ("all", *PHYSICS_TARGET_NAMES, *PHYSICS_AUX_TARGET_ALIASES)
 
 PHYSICS_TARGET_SCALES = torch.tensor(
-    [10.0, 200.0, 90.0, 20.0, 3000.0, 30.0, 1.0, 1.0, 10.0, 10.0, 30.0],
+    [10.0, 200.0, 90.0, 20.0, 3000.0, 30.0, 1.0, 1.0, 10.0, 10.0, 30.0, 1.0, 1.0],
     dtype=torch.float32,
 )
 
 PHYSICS_TARGET_OFFSETS = torch.tensor(
-    [0.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 0.0, -100.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0, 0.0, 0.0, -100.0, 0.0, 0.0],
     dtype=torch.float32,
 )
 
@@ -102,6 +105,7 @@ class PreprocessedSample:
     los_aoa_az_deg: float = math.nan
     first_path_power_dbw: float = math.nan
     first_path_aoa_az_deg: float = math.nan
+    first_path_aod_az_deg: float = math.nan
     reflection_count: int = 0
     diffraction_count: int = 0
     reflection_path_count: int = 0
@@ -201,6 +205,7 @@ def _ensure_continuous_fields(sample: PreprocessedSample) -> PreprocessedSample:
         "los_aoa_az_deg": math.nan,
         "first_path_power_dbw": math.nan,
         "first_path_aoa_az_deg": math.nan,
+        "first_path_aod_az_deg": math.nan,
         "reflection_count": 0,
         "diffraction_count": 0,
         "reflection_path_count": 0,
@@ -275,6 +280,14 @@ def physics_raw_values(sample: PreprocessedSample) -> torch.Tensor:
         if math.isfinite(first_path_aoa_az_deg)
         else math.nan
     )
+    first_path_aod_az_deg = _finite_or_nan(
+        getattr(sample, "first_path_aod_az_deg", math.nan)
+    )
+    first_path_aod_az_rad = (
+        math.radians(first_path_aod_az_deg)
+        if math.isfinite(first_path_aod_az_deg)
+        else math.nan
+    )
     return torch.tensor(
         [
             _finite_or_nan(sample.n_paths),
@@ -288,6 +301,8 @@ def physics_raw_values(sample: PreprocessedSample) -> torch.Tensor:
             _finite_or_nan(sample.reflection_count),
             _finite_or_nan(sample.diffraction_count),
             _finite_or_nan(getattr(sample, "total_received_power_dbw", math.nan)),
+            math.sin(first_path_aod_az_rad) if math.isfinite(first_path_aod_az_rad) else math.nan,
+            math.cos(first_path_aod_az_rad) if math.isfinite(first_path_aod_az_rad) else math.nan,
         ],
         dtype=torch.float32,
     )
@@ -608,6 +623,7 @@ def build_synthetic_samples(
             first_path_delay_s=float((idx % 3 + 1) * 800e-9),
             first_path_power_dbw=float(-80.0 - (idx % 3) * 10.0),
             first_path_aoa_az_deg=float((-60.0, 0.0, 60.0)[idx % 3]),
+            first_path_aod_az_deg=float((-45.0, 15.0, 75.0)[idx % 3]),
             reflection_count=idx % 5,
             diffraction_count=idx % 4,
             config_key=config_key,
@@ -639,6 +655,7 @@ def build_synthetic_samples(
                 first_path_power_dbw=float(-80.0 - (idx % 3) * 10.0),
                 total_received_power_dbw=float(-75.0 - (idx % 3) * 10.0),
                 first_path_aoa_az_deg=float((-60.0, 0.0, 60.0)[idx % 3]),
+                first_path_aod_az_deg=float((-45.0, 15.0, 75.0)[idx % 3]),
                 reflection_count=idx % 5,
                 diffraction_count=idx % 4,
             )

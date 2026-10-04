@@ -10,15 +10,16 @@
 - `prepare_data.py`：匹配已有 40k/10k CSI 样本与 D2Los `.propbin(.gz)` 路径，生成固定 train/val/test 标签清单；
 - `data_io.py`：按清单引用原 `.pt` 样本，不额外复制数 GB 的 CSI；
 - `pretrained.py`：提取冻结 Full embedding 和冻结模型预测的物理量；
-- `run_experiment.py`：在完全相同的数据与标签上训练和测试四个模型，并导出完整指标和混淆矩阵。
+- `run_experiment.py`：在完全相同的数据与标签上训练和测试五个模型，并导出完整指标和混淆矩阵。
 - `diagnose_intervals.py`：按真实 CP 区间分析召回率、错误方向、标签边界难度和物理预测误差。
 
-四种模型是：
+五种模型是：
 
 1. `scratch`：随机初始化 CSI encoder，端到端训练 encoder 和 CP 分类头；
-2. `full_embedding`：冻结预训练模型，只训练基于 256 维 Full embedding 的分类头；
-3. `full_physics`：冻结预训练模型，只训练基于 Full embedding 与预测物理量的分类头。
-4. `full_physics_finetune`：以 Full 的 CSI encoder 参数为起点，解冻最后若干 Transformer 层和输出投影，与 CP 分类头一起训练；物理量仍来自冻结教师模型。
+2. `scratch_physics`：随机初始化并训练 CSI encoder，同时拼接冻结教师模型预测的物理量；
+3. `full_embedding`：冻结预训练模型，只训练基于 256 维 Full embedding 的分类头；
+4. `full_physics`：冻结预训练模型，只训练基于 Full embedding 与预测物理量的分类头。
+5. `full_physics_finetune`：以 Full 的 CSI encoder 参数为起点，解冻最后若干 Transformer 层和输出投影，与 CP 分类头一起训练；物理量仍来自冻结教师模型。
 
 若要进行整个 CSI encoder 全量微调（输入投影、位置/频率编码、全部 Transformer 层和输出投影），使用 `--unfreeze-all-encoder`。物理预测仍来自冻结教师缓存，不参与更新。
 
@@ -63,7 +64,7 @@ outside_ratio(CP) = energy(excess_delay > CP) / total_path_energy
 
 ### 最长 CP 仍不够时
 
-默认 `--overflow-policy drop`：若 640 ns 下 CP 外能量仍超过 1%，样本不会获得错误的 CP-5 标签，而是从四个模型共同使用的数据中删除；程序会报告 overflow 数量和各 split 的最终分布。
+默认 `--overflow-policy drop`：若 640 ns 下 CP 外能量仍超过 1%，样本不会获得错误的 CP-5 标签，而是从五个模型共同使用的数据中删除；程序会报告 overflow 数量和各 split 的最终分布。
 
 如果 overflow 较多，推荐重新加入第六类：
 
@@ -73,7 +74,7 @@ outside_ratio(CP) = energy(excess_delay > CP) / total_path_energy
 
 这时训练脚本会自动变成六分类，无需修改代码。若确实想把超长样本截断到最后一类，可以显式使用 `--overflow-policy last`，但此时最后一类不再严格满足 1% 门限。`--overflow-policy error` 可用于严格审计。
 
-## 第二步：运行四模型实验
+## 第二步：运行五模型实验
 
 默认使用带 reflection-path-count 预测头的 Full CSI2TEXT-PGMT checkpoint：
 
@@ -147,6 +148,7 @@ L = CE + lambda_safe * sum_c p(c|CSI) * max(0, r_out(c) - 0.01)
 
 ```bash
 --models scratch
+--models scratch_physics
 --models full_embedding
 --models full_physics
 --models full_physics_finetune
@@ -177,10 +179,38 @@ CUDA 可用时默认使用 CUDA 和混合精度。指定 GPU 可用 `--device cu
 
 ## 实验解释注意事项
 
-- 四个模型读取同一个标签清单，因此训练、验证、测试样本完全一致。
+- 五个模型读取同一个标签清单，因此训练、验证、测试样本完全一致。
 - Full+Physics 会检查 checkpoint 参数中是否能看出 delay spread、总路径数和反射路径数预测头接受过监督；若看不出来会给出 warning，而不是静默把随机物理头当作有效预测。
 - 若该 50k 数据中的测试链路在 Full 模型预训练阶段已经出现过，实验只能作为初步可行性结果。正式论文结果需要额外审计预训练集合与下游测试 `group_id` 的交集，或使用严格未见地图/链路划分。
 - 当前标签基于理想定时同步后的相对时延，首径绝对传播时延不会影响 CP 类别。
+
+## 大语言模型 CP baseline
+
+先用 `make_llm_subsets.py` 从完整 CP manifest 的各原始 split 内按类别分层抽样，生成两个嵌套数据集：
+
+- smoke：train/val/test = 1000/500/500；
+- formal：train/val/test = 10000/5000/5000。
+
+smoke 的每个 split 都是 formal 对应 split 的真子集。抽样只在父 manifest 原有的 train、val、test 内分别进行，不会把验证或测试链路放入训练集，并继续保证 `group_id` 无跨集泄漏。
+
+`run_llm_baseline.py` 使用统一结构：
+
+```text
+CSIEncoder -> soft-prefix projector -> language backbone -> 5-class CP head
+```
+
+- Qwen3.5-2B 使用 `--full-lm`，训练文本语言主干、CSI encoder、projector 和 CP head；视觉/MTP 辅助模块保持冻结。
+- DeepSeek-R1-0528-Qwen3-8B 与 InternLM3-8B-Instruct 不使用 `--full-lm`，冻结语言模型，仅训练随机初始化的 CSI encoder、soft-prefix projector 和 CP head。梯度仍通过冻结语言模型传回输入 projector。
+- 所有模型使用相同的 CP 标签、交叉熵、验证集 early stopping 和测试指标，且不使用 oracle 物理量。
+- `--max-train-steps` 用于 smoke test；正式实验应省略该参数并增加 epochs/patience。
+
+冻结 LLM 出现多数类坍缩时，可用 `--diagnostics` 将首个 batch 的 CSI、
+mapped prefix、LLM pooled hidden、logits 样本间差异，以及首次反向传播的梯度范数和
+首次 optimizer step 的参数改变量写入 `diagnostics.json`。`--csi-checkpoint` 可加载已训练的
+CSI encoder；`--align-prefix-to-token-rms` 将连续 prefix 对齐到原生 token embedding 的
+近似 RMS；`--append-query-token` 会追加一个由 BOS embedding 初始化的可训练查询 token，
+并从查询位置做 CP 分类。这三个改动均为显式开关，因此可以和原始 frozen-soft-prefix
+baseline 做独立消融。
 
 ## 区间与原因诊断
 

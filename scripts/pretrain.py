@@ -639,6 +639,7 @@ def build_components_from_samples(
     array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
     shared_physics_token_residual_scale: float = 1.0,
     attribute_fields: tuple[str, ...] = (),
@@ -720,6 +721,7 @@ def build_components_from_samples(
         use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
         los_angle_context_token_norm_mode=token_norm_mode,
         use_shared_physics_token=use_shared_physics_token,
         shared_physics_token_residual_scale=shared_physics_token_residual_scale,
@@ -753,6 +755,66 @@ def freeze_text_and_prototypes(model: CSIClip) -> None:
         model.prototypes.requires_grad = False
 
 
+SEMANTIC_ANCHOR_MODES = (
+    "fixed",
+    "adaptive_prototypes",
+    "joint",
+)
+
+
+def semantic_anchor_freeze_policy(mode: str) -> tuple[bool, bool]:
+    """Return ``(freeze_text_encoder, freeze_prototypes)`` for an ablation mode."""
+    policies = {
+        "fixed": (True, True),
+        "adaptive_prototypes": (True, False),
+        "joint": (False, False),
+    }
+    try:
+        return policies[mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown semantic anchor mode {mode!r}; choose from: "
+            f"{', '.join(SEMANTIC_ANCHOR_MODES)}."
+        ) from exc
+
+
+def infer_semantic_anchor_mode(
+    freeze_text_encoder: bool,
+    freeze_prototypes: bool,
+) -> str:
+    for mode in SEMANTIC_ANCHOR_MODES:
+        if semantic_anchor_freeze_policy(mode) == (
+            freeze_text_encoder,
+            freeze_prototypes,
+        ):
+            return mode
+    return "custom"
+
+
+def freeze_prototype_bank(model: CSIClip) -> None:
+    if model.prototypes is not None:
+        model.prototypes.requires_grad = False
+
+
+@torch.no_grad()
+def canonical_text_features(
+    model: CSIClip,
+    prototype_token_ids: torch.Tensor,
+    prototype_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Capture normalized canonical text anchors on CPU for drift auditing."""
+    was_training = model.text.training
+    model.text.eval()
+    features = model.encode_text(
+        prototype_token_ids.to(next(model.parameters()).device),
+        prototype_token_mask.to(next(model.parameters()).device),
+        normalize=True,
+    ).detach().cpu().clone()
+    if was_training:
+        model.text.train()
+    return features
+
+
 def checkpoint_has_compatible_prototypes(
     model: CSIClip,
     checkpoint: dict | None,
@@ -784,17 +846,12 @@ def initialize_prototypes_from_canonical_text(
 ) -> None:
     if model.prototypes is None:
         return
-    was_training = model.text.training
-    model.text.eval()
-    with torch.no_grad():
-        text_features = model.encode_text(
-            prototype_token_ids.to(next(model.parameters()).device),
-            prototype_token_mask.to(next(model.parameters()).device),
-            normalize=True,
-        )
-        model.initialize_prototypes(text_features, normalize=False)
-    if was_training:
-        model.text.train()
+    text_features = canonical_text_features(
+        model,
+        prototype_token_ids,
+        prototype_token_mask,
+    )
+    model.initialize_prototypes(text_features, normalize=False)
 
 
 def trainable_parameters(model: torch.nn.Module):
@@ -1031,6 +1088,7 @@ def build_demo_components(
     array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
     shared_physics_token_residual_scale: float = 1.0,
     attribute_fields: tuple[str, ...] = (),
@@ -1061,6 +1119,7 @@ def build_demo_components(
         array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
         shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_fields,
@@ -1088,6 +1147,7 @@ def build_real_components(
     array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
     shared_physics_token_residual_scale: float = 1.0,
     min_class_size: int = 1,
@@ -1231,6 +1291,7 @@ def build_real_components(
         array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
         shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_fields,
@@ -1253,6 +1314,8 @@ def run_smoke_test(
     attribute_classifier_class_weight: str = "none",
     attribute_classifier_logit_adjustment: float = 0.0,
     aux_regression_weight: float = 0.0,
+    first_path_aod_weight: float = 0.0,
+    first_path_aod_nlos_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
     k_factor_loss_weights: dict[str, float] | None = None,
     strong_k_bin_classifier_weight: float = 0.0,
@@ -1319,6 +1382,7 @@ def run_smoke_test(
     array_token_min_tokens: int = 4,
     use_los_angle_context_encoder: bool = False,
     use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
     use_shared_physics_token: bool = False,
     shared_physics_token_residual_scale: float = 1.0,
     noise_augmentation_enabled: bool = False,
@@ -1351,6 +1415,7 @@ def run_smoke_test(
         array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
         shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_classifier_fields,
@@ -1395,6 +1460,8 @@ def run_smoke_test(
                     attribute_classifier_class_weight=attribute_classifier_class_weight,
                     attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
+                    first_path_aod_weight=first_path_aod_weight,
+                    first_path_aod_nlos_weight=first_path_aod_nlos_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
                     k_factor_loss_weights=k_factor_loss_weights,
                     strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
@@ -1499,6 +1566,7 @@ def run_real_pretrain(
     array_token_min_tokens: int,
     use_los_angle_context_encoder: bool,
     use_first_path_angle_context_encoder: bool,
+    use_first_path_aod_context_encoder: bool,
     use_shared_physics_token: bool,
     shared_physics_token_residual_scale: float,
     warmup_epochs: int,
@@ -1516,6 +1584,8 @@ def run_real_pretrain(
     attribute_classifier_class_weight: str,
     attribute_classifier_logit_adjustment: float,
     aux_regression_weight: float,
+    first_path_aod_weight: float,
+    first_path_aod_nlos_weight: float,
     aux_regression_targets: tuple[str, ...],
     k_factor_loss_weights: dict[str, float] | None,
     strong_k_bin_classifier_weight: float,
@@ -1591,7 +1661,9 @@ def run_real_pretrain(
     max_delay_spread_ns: float | None,
     allow_prototype_mismatch_transfer: bool,
     freeze_csi: bool,
-    freeze_text_prototypes: bool,
+    freeze_text_encoder: bool,
+    freeze_prototypes: bool,
+    semantic_anchor_mode: str,
     seed: int,
     output_dir: str,
     save_every: int,
@@ -1621,6 +1693,7 @@ def run_real_pretrain(
         array_token_min_tokens=array_token_min_tokens,
         use_los_angle_context_encoder=use_los_angle_context_encoder,
         use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
         use_shared_physics_token=use_shared_physics_token,
         shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         min_class_size=min_class_size,
@@ -1638,6 +1711,17 @@ def run_real_pretrain(
             else None
         ),
     )
+    if first_path_aod_weight > 0.0 or first_path_aod_nlos_weight > 0.0:
+        aod_label_count = sum(
+            math.isfinite(float(getattr(sample, "first_path_aod_az_deg", math.nan)))
+            for sample in loader.dataset.samples
+        )
+        print(f"first_path_aod_label_count={aod_label_count}/{len(loader.dataset.samples)}")
+        if aod_label_count == 0:
+            raise ValueError(
+                "AoD supervision is enabled, but the training split has no finite "
+                "first_path_aod_az_deg labels. Regenerate the AoD data pool first."
+            )
     model.first_path_power_delta_limit = float(first_path_power_delta_limit)
     if transfer_checkpoint is not None:
         try:
@@ -1662,10 +1746,27 @@ def run_real_pretrain(
             prototype_bank["token_ids"],
             prototype_bank["token_mask"],
         )
+    initial_text_features = canonical_text_features(
+        model,
+        prototype_bank["token_ids"],
+        prototype_bank["token_mask"],
+    )
+    if transfer_checkpoint is not None:
+        saved_initial_text_features = transfer_checkpoint.get(
+            "prototype_initial_text_features"
+        )
+        if (
+            isinstance(saved_initial_text_features, torch.Tensor)
+            and tuple(saved_initial_text_features.shape)
+            == tuple(initial_text_features.shape)
+        ):
+            initial_text_features = saved_initial_text_features.detach().cpu().clone()
     if freeze_csi:
         freeze_module(model.csi)
-    if freeze_text_prototypes:
-        freeze_text_and_prototypes(model)
+    if freeze_text_encoder:
+        freeze_module(model.text)
+    if freeze_prototypes:
+        freeze_prototype_bank(model)
     optimizer_parameters = trainable_parameters(model)
     if not optimizer_parameters:
         raise ValueError("No trainable parameters remain after applying freeze options.")
@@ -1692,6 +1793,8 @@ def run_real_pretrain(
         attribute_classifier_class_weight=attribute_classifier_class_weight,
         attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
         aux_regression_weight=aux_regression_weight,
+        first_path_aod_weight=first_path_aod_weight,
+        first_path_aod_nlos_weight=first_path_aod_nlos_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
         k_factor_loss_weights=k_factor_loss_weights,
         strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
@@ -1742,7 +1845,9 @@ def run_real_pretrain(
         first_path_power_use_internal_gate=first_path_power_use_internal_gate,
         nlos_enhanced_power_loss=nlos_enhanced_power_loss,
         freeze_csi=freeze_csi,
-        freeze_text_prototypes=freeze_text_prototypes,
+        freeze_text_encoder=freeze_text_encoder,
+        freeze_prototypes=freeze_prototypes,
+        freeze_text_prototypes=freeze_text_encoder and freeze_prototypes,
         multipositive_distance_threshold=multipositive_distance_threshold,
         multipositive_positive_mode=multipositive_positive_mode,
         min_class_size_for_multipositive=min_class_size_for_multipositive,
@@ -1786,6 +1891,7 @@ def run_real_pretrain(
         f"array_token_min_tokens={array_token_min_tokens} "
         f"use_los_angle_context_encoder={use_los_angle_context_encoder} "
         f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder} "
+        f"use_first_path_aod_context_encoder={use_first_path_aod_context_encoder} "
         f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
     )
     print(
@@ -1803,6 +1909,8 @@ def run_real_pretrain(
         f"attribute_classifier_logit_adjustment={attribute_classifier_logit_adjustment} "
         f"attribute_remap={format_attribute_remap(attribute_remap)} "
         f"aux_regression_weight={aux_regression_weight} "
+        f"first_path_aod_weight={first_path_aod_weight} "
+        f"first_path_aod_nlos_weight={first_path_aod_nlos_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
         f"k_factor_loss_weights={format_k_factor_loss_weights(k_factor_loss_weights)} "
         f"strong_k_bin_classifier_weight={strong_k_bin_classifier_weight} "
@@ -1879,9 +1987,14 @@ def run_real_pretrain(
         f"limit_samples_by_attribute={limit_samples_by_attribute} "
         f"limit_samples_per_attribute_value={limit_samples_per_attribute_value} "
         f"max_delay_spread_ns={max_delay_spread_ns} "
-        f"freeze_csi={freeze_csi} freeze_text_prototypes={freeze_text_prototypes} "
+        f"freeze_csi={freeze_csi} semantic_anchor_mode={semantic_anchor_mode} "
+        f"freeze_text_encoder={freeze_text_encoder} "
+        f"freeze_prototypes={freeze_prototypes} "
         f"trainable_parameters={count_trainable_parameters(model)}"
     )
+    print(f"semantic_anchor_mode={semantic_anchor_mode}")
+    print(f"freeze_text_encoder={freeze_text_encoder}")
+    print(f"freeze_prototypes={freeze_prototypes}")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     log_path = output_path / "train_log.jsonl"
@@ -2619,9 +2732,12 @@ def run_real_pretrain(
                         "array_token_min_tokens": array_token_min_tokens,
                         "use_los_angle_context_encoder": use_los_angle_context_encoder,
                         "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
+                        "use_first_path_aod_context_encoder": use_first_path_aod_context_encoder,
                         "use_shared_physics_token": use_shared_physics_token,
                         "shared_physics_token_residual_scale": shared_physics_token_residual_scale,
                         "aux_regression_weight": aux_regression_weight,
+                        "first_path_aod_weight": first_path_aod_weight,
+                        "first_path_aod_nlos_weight": first_path_aod_nlos_weight,
                         "aux_regression_targets": list(aux_regression_targets),
                         "k_factor_loss_weights": k_factor_loss_weights,
                         "strong_k_bin_classifier_weight": strong_k_bin_classifier_weight,
@@ -2692,7 +2808,10 @@ def run_real_pretrain(
                         "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
                         "max_delay_spread_ns": max_delay_spread_ns,
                         "freeze_csi": freeze_csi,
-                        "freeze_text_prototypes": freeze_text_prototypes,
+                        "semantic_anchor_mode": semantic_anchor_mode,
+                        "freeze_text_encoder": freeze_text_encoder,
+                        "freeze_prototypes": freeze_prototypes,
+                        "freeze_text_prototypes": freeze_text_encoder and freeze_prototypes,
                         "multipositive_positive_count_mean": mean_positive_count,
                         "lr": scheduler.get_last_lr()[0],
                     }
@@ -2708,6 +2827,7 @@ def run_real_pretrain(
                 "tokenizer_word2id": tokenizer.word2id,
                 "prototype_keys": serialize_prototype_keys(prototype_bank["keys"]),
                 "prototype_captions": prototype_bank["captions"],
+                "prototype_initial_text_features": initial_text_features,
                 "args": {
                     "data_path": data_path,
                     "additional_data_paths": list(additional_data_paths),
@@ -2742,6 +2862,7 @@ def run_real_pretrain(
                     "array_token_min_tokens": array_token_min_tokens,
                     "use_los_angle_context_encoder": use_los_angle_context_encoder,
                     "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
+                    "use_first_path_aod_context_encoder": use_first_path_aod_context_encoder,
                     "use_shared_physics_token": use_shared_physics_token,
                     "shared_physics_token_residual_scale": shared_physics_token_residual_scale,
                     "warmup_epochs": warmup_epochs,
@@ -2777,6 +2898,8 @@ def run_real_pretrain(
                         for field, mapping in attribute_remap.items()
                     },
                     "aux_regression_weight": aux_regression_weight,
+                    "first_path_aod_weight": first_path_aod_weight,
+                    "first_path_aod_nlos_weight": first_path_aod_nlos_weight,
                     "aux_regression_targets": list(aux_regression_targets),
                     "k_factor_loss_weights": k_factor_loss_weights,
                     "strong_k_bin_classifier_weight": strong_k_bin_classifier_weight,
@@ -2847,7 +2970,10 @@ def run_real_pretrain(
                     "max_delay_spread_ns": max_delay_spread_ns,
                     "allow_prototype_mismatch_transfer": allow_prototype_mismatch_transfer,
                     "freeze_csi": freeze_csi,
-                    "freeze_text_prototypes": freeze_text_prototypes,
+                    "semantic_anchor_mode": semantic_anchor_mode,
+                    "freeze_text_encoder": freeze_text_encoder,
+                    "freeze_prototypes": freeze_prototypes,
+                    "freeze_text_prototypes": freeze_text_encoder and freeze_prototypes,
                     "phase": f"csi_clip_{text_mode}_text",
                 },
             }
@@ -2976,6 +3102,11 @@ def main() -> None:
         help="Use a first-path selector context branch dedicated to first-path angle prediction.",
     )
     parser.add_argument(
+        "--use-first-path-aod-context-encoder",
+        action=argparse.BooleanOptionalAction,
+        help="Use a separate first-path selector context branch for AoD prediction.",
+    )
+    parser.add_argument(
         "--use-shared-physics-token",
         action=argparse.BooleanOptionalAction,
         help=(
@@ -3041,6 +3172,8 @@ def main() -> None:
         ),
     )
     parser.add_argument("--aux-regression-weight", type=float)
+    parser.add_argument("--first-path-aod-weight", type=float)
+    parser.add_argument("--first-path-aod-nlos-weight", type=float)
     parser.add_argument(
         "--k-factor-loss-weight",
         action="append",
@@ -3425,7 +3558,19 @@ def main() -> None:
     parser.add_argument(
         "--freeze-text-prototypes",
         action="store_true",
-        help="Freeze the text encoder and learnable prototypes.",
+        help=(
+            "Deprecated compatibility flag that freezes both the text encoder "
+            "and learnable prototypes. Prefer --semantic-anchor-mode."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-anchor-mode",
+        choices=SEMANTIC_ANCHOR_MODES,
+        help=(
+            "Ablation policy: fixed freezes text/prototypes; adaptive_prototypes "
+            "freezes text only; joint trains both. This overrides the legacy "
+            "freeze_text_prototypes config value."
+        ),
     )
     parser.add_argument("--min-class-size-for-multipositive", type=int)
     parser.add_argument(
@@ -3582,6 +3727,11 @@ def main() -> None:
         if args.use_first_path_angle_context_encoder is not None
         else bool(cfg_get(train_cfg, "use_first_path_angle_context_encoder", False))
     )
+    use_first_path_aod_context_encoder = (
+        args.use_first_path_aod_context_encoder
+        if args.use_first_path_aod_context_encoder is not None
+        else bool(cfg_get(train_cfg, "use_first_path_aod_context_encoder", False))
+    )
     use_shared_physics_token = (
         args.use_shared_physics_token
         if args.use_shared_physics_token is not None
@@ -3675,6 +3825,20 @@ def main() -> None:
         if args.aux_regression_weight is not None
         else float(cfg_get(train_cfg, "aux_regression_weight", 0.0))
     )
+    first_path_aod_weight = (
+        args.first_path_aod_weight
+        if args.first_path_aod_weight is not None
+        else float(cfg_get(train_cfg, "first_path_aod_weight", aux_regression_weight))
+    )
+    if first_path_aod_weight < 0.0:
+        raise ValueError("--first-path-aod-weight must be non-negative.")
+    first_path_aod_nlos_weight = (
+        args.first_path_aod_nlos_weight
+        if args.first_path_aod_nlos_weight is not None
+        else float(cfg_get(train_cfg, "first_path_aod_nlos_weight", 0.0))
+    )
+    if first_path_aod_nlos_weight < 0.0:
+        raise ValueError("--first-path-aod-nlos-weight must be non-negative.")
     k_factor_loss_weights = parse_k_factor_loss_weights(
         args.k_factor_loss_weight
         if args.k_factor_loss_weight is not None
@@ -4021,6 +4185,13 @@ def main() -> None:
         if args.aux_regression_targets is not None
         else cfg_get(train_cfg, "aux_regression_targets", "all")
     )
+    if first_path_aod_weight > 0.0 or first_path_aod_nlos_weight > 0.0:
+        aod_names = {"first_path_aod_az_sin", "first_path_aod_az_cos"}
+        if "all" not in aux_regression_targets and not aod_names.issubset(aux_regression_targets):
+            raise ValueError(
+                "Positive AoD loss weight requires first_path_aod_az_deg "
+                "(or both AoD sin/cos targets) in --aux-regression-targets."
+            )
     multipositive_distance_threshold = (
         args.multipositive_distance_threshold
         if args.multipositive_distance_threshold is not None
@@ -4151,9 +4322,36 @@ def main() -> None:
     if max_delay_spread_ns is not None:
         max_delay_spread_ns = float(max_delay_spread_ns)
     freeze_csi = bool(args.freeze_csi or cfg_get(train_cfg, "freeze_csi", False))
-    freeze_text_prototypes = bool(
-        args.freeze_text_prototypes
-        or cfg_get(train_cfg, "freeze_text_prototypes", False)
+    requested_semantic_anchor_mode = args.semantic_anchor_mode
+    if requested_semantic_anchor_mode is None and args.freeze_text_prototypes:
+        requested_semantic_anchor_mode = "fixed"
+    if requested_semantic_anchor_mode is None:
+        requested_semantic_anchor_mode = train_cfg.get("semantic_anchor_mode")
+    if requested_semantic_anchor_mode is not None:
+        freeze_text_encoder, freeze_prototypes = semantic_anchor_freeze_policy(
+            str(requested_semantic_anchor_mode)
+        )
+    else:
+        legacy_freeze_text_prototypes = bool(
+            cfg_get(train_cfg, "freeze_text_prototypes", False)
+        )
+        freeze_text_encoder = bool(
+            cfg_get(
+                train_cfg,
+                "freeze_text_encoder",
+                legacy_freeze_text_prototypes,
+            )
+        )
+        freeze_prototypes = bool(
+            cfg_get(
+                train_cfg,
+                "freeze_prototypes",
+                legacy_freeze_text_prototypes,
+            )
+        )
+    semantic_anchor_mode = infer_semantic_anchor_mode(
+        freeze_text_encoder,
+        freeze_prototypes,
     )
     output_dir = args.output_dir if args.output_dir is not None else str(cfg_get(train_cfg, "output_dir", "artifacts/pretrain_csi_clip"))
     save_every = args.save_every if args.save_every is not None else int(cfg_get(train_cfg, "save_every", 1))
@@ -4175,6 +4373,8 @@ def main() -> None:
             attribute_classifier_class_weight=attribute_classifier_class_weight,
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
+            first_path_aod_weight=first_path_aod_weight,
+            first_path_aod_nlos_weight=first_path_aod_nlos_weight,
             aux_regression_targets=aux_regression_targets,
             k_factor_loss_weights=k_factor_loss_weights,
             strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
@@ -4241,6 +4441,7 @@ def main() -> None:
             array_token_min_tokens=array_token_min_tokens,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+            use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
             use_shared_physics_token=use_shared_physics_token,
             shared_physics_token_residual_scale=shared_physics_token_residual_scale,
             noise_augmentation_enabled=noise_augmentation_enabled,
@@ -4293,6 +4494,7 @@ def main() -> None:
             array_token_min_tokens=array_token_min_tokens,
             use_los_angle_context_encoder=use_los_angle_context_encoder,
             use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+            use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
             use_shared_physics_token=use_shared_physics_token,
             shared_physics_token_residual_scale=shared_physics_token_residual_scale,
             warmup_epochs=warmup_epochs,
@@ -4310,6 +4512,8 @@ def main() -> None:
             attribute_classifier_class_weight=attribute_classifier_class_weight,
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
+            first_path_aod_weight=first_path_aod_weight,
+            first_path_aod_nlos_weight=first_path_aod_nlos_weight,
             aux_regression_targets=aux_regression_targets,
             k_factor_loss_weights=k_factor_loss_weights,
             strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
@@ -4385,7 +4589,9 @@ def main() -> None:
             max_delay_spread_ns=max_delay_spread_ns,
             allow_prototype_mismatch_transfer=args.allow_prototype_mismatch_transfer,
             freeze_csi=freeze_csi,
-            freeze_text_prototypes=freeze_text_prototypes,
+            freeze_text_encoder=freeze_text_encoder,
+            freeze_prototypes=freeze_prototypes,
+            semantic_anchor_mode=semantic_anchor_mode,
             seed=seed,
             output_dir=output_dir,
             save_every=save_every,

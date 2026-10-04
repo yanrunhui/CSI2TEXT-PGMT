@@ -40,6 +40,13 @@ KEY_METRICS = (
     "reflection_count_head_pearson",
     "n_paths_MAE",
     "azimuth_spread_MAE",
+    "physical_description_los_status_accuracy",
+    "csi_to_learnable_prototype_R@1",
+    "csi_to_learnable_prototype_MRR",
+    "prototype_to_initial_text_cosine_mean",
+    "prototype_drift_Dp",
+    "prototype_to_final_text_cosine_mean",
+    "final_text_to_initial_text_cosine_mean",
 )
 
 TRAIN_METADATA_KEYS = (
@@ -58,6 +65,9 @@ TRAIN_METADATA_KEYS = (
     "training_end_time",
     "training_elapsed_seconds",
     "training_elapsed_hms",
+    "semantic_anchor_mode",
+    "freeze_text_encoder",
+    "freeze_prototypes",
 )
 
 
@@ -74,6 +84,21 @@ class AblationSpec:
 
 
 ABLATIONS = (
+    AblationSpec(
+        name="fixed_semantic_anchors",
+        purpose="Freeze the text encoder and prototype bank.",
+        train_overrides=("--semantic-anchor-mode", "fixed"),
+    ),
+    AblationSpec(
+        name="adaptive_prototypes",
+        purpose="Freeze canonical text anchors while adapting the prototype bank.",
+        train_overrides=("--semantic-anchor-mode", "adaptive_prototypes"),
+    ),
+    AblationSpec(
+        name="joint_semantic_learning",
+        purpose="Jointly train the text encoder and prototype bank.",
+        train_overrides=("--semantic-anchor-mode", "joint"),
+    ),
     AblationSpec(
         name="full_multitask",
         purpose="Reference full multi-task physics model.",
@@ -180,6 +205,11 @@ ABLATIONS = (
 )
 
 ABLATION_GROUPS = {
+    "semantic_anchors": (
+        "fixed_semantic_anchors",
+        "adaptive_prototypes",
+        "joint_semantic_learning",
+    ),
     "language": (
         "no_csi_text_alignment",
         "no_text_prototype_alignment",
@@ -298,6 +328,8 @@ def build_evaluate_command(
         str(args.eval_batch_size),
         "--save-signal-descriptions",
         str(output_dir / "signal_descriptions.pt"),
+        "--save-prototype-diagnostics",
+        str(output_dir / "prototype_diagnostics.csv"),
         "--signal-description-correction",
         args.signal_description_correction,
         "--verbose-diagnostics",
@@ -584,8 +616,8 @@ def main() -> None:
         nargs="+",
         default=("all",),
         help=(
-            "Ablations to include, or a group: language, architecture, "
-            "physical_branches, all. "
+            "Ablations to include, or a group: semantic_anchors, language, "
+            "architecture, physical_branches, all. "
             "Use --list to print names."
         ),
     )

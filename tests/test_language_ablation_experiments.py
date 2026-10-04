@@ -15,6 +15,7 @@ from scripts.run_ablation_experiments import (
     format_mean_std,
     selected_specs,
 )
+from scripts.pretrain import semantic_anchor_freeze_policy
 
 
 def _spec(name: str):
@@ -22,6 +23,35 @@ def _spec(name: str):
 
 
 class LanguageAblationExperimentTest(unittest.TestCase):
+    def test_semantic_anchor_ablation_has_exact_freeze_policies(self) -> None:
+        expected = {
+            "fixed_semantic_anchors": ("--semantic-anchor-mode", "fixed"),
+            "adaptive_prototypes": (
+                "--semantic-anchor-mode",
+                "adaptive_prototypes",
+            ),
+            "joint_semantic_learning": ("--semantic-anchor-mode", "joint"),
+        }
+        for name, overrides in expected.items():
+            self.assertEqual(_spec(name).train_overrides, overrides)
+
+        self.assertEqual(semantic_anchor_freeze_policy("fixed"), (True, True))
+        self.assertEqual(
+            semantic_anchor_freeze_policy("adaptive_prototypes"),
+            (True, False),
+        )
+        self.assertEqual(semantic_anchor_freeze_policy("joint"), (False, False))
+
+    def test_semantic_anchor_group_order(self) -> None:
+        self.assertEqual(
+            [spec.name for spec in selected_specs(("semantic_anchors",))],
+            [
+                "fixed_semantic_anchors",
+                "adaptive_prototypes",
+                "joint_semantic_learning",
+            ],
+        )
+
     def test_requested_language_ablations_have_exact_loss_overrides(self) -> None:
         self.assertEqual(
             _spec("no_csi_text_alignment").train_overrides,
