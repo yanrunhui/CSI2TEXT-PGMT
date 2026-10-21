@@ -22,7 +22,9 @@ CSI_model/
 │   ├── train.yaml                 # Canonical training configuration
 │   └── experiments/
 │       └── siso.yaml              # SISO/BUPT experiment configuration
-├── csi_to_text/                   # Core models, datasets and training modules
+├── data/                          # Dataset loading and CSI preprocessing modules
+├── models/                        # CSI2TEXT-PGMT model components
+├── training/                      # Training objectives and trainer implementation
 ├── scripts/                       # Preprocessing, training and evaluation scripts
 ├── tests/                         # Automated tests
 ├── downstream_beam_selection/     # Beam-selection task
