@@ -9,3 +9,25 @@ artifacts/
 
 Raytracing_scenarios/
 deepmimo_scenarios/
+
+# Track Python source files, ignore downloaded model directories.
+/models/*
+!/models/*.py
+
+paper/
+output/
+/output 2/
+outputs/
+tmp/
+
+# Local tools and editor configuration.
+/.codex_tmp/
+/.codex_build/
+/.vscode/
+
+# Duplicate paper working directories.
+/CSI2TEXT_PGMT_overleaf_full/
+/overleaf_project/
+/overleaf_project_full/
+
+*.zip

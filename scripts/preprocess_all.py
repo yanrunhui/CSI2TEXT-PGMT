@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import re
 import sys
 import warnings
@@ -19,14 +20,20 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.caption import CaptionGenerator
-from data.dataset import PreprocessedSample
+from data.dataset import (
+    DELAY_POWER_MAP_SHAPE,
+    DELAY_POWER_PROFILE_BINS,
+    PreprocessedSample,
+    regular_array_coordinates,
+)
 from data.preprocess import preprocess_sample
-from data.semantic_key import SemanticKey
 
 PROP_MAGIC = {b"PORP", b"PROP"}
 PROP_HEADER_BYTES = 32
 PROP_RX_RECORD_BYTES = 32
 PROP_PATH_RECORD_BYTES = 24
+DELAY_POWER_MAP_DELAY_NS_RANGE = (0.0, 3000.0)
+DELAY_POWER_MAP_POWER_DBW_RANGE = (-140.0, -40.0)
 
 PROP_RX_DTYPE = np.dtype(
     [
@@ -371,6 +378,23 @@ def _summed_interaction_counts(inter_code: np.ndarray, valid_mask: np.ndarray) -
     return totals
 
 
+def _interaction_path_counts(inter_code: np.ndarray, valid_mask: np.ndarray) -> dict[str, int]:
+    totals = {"direct": 0, "reflection": 0, "diffraction": 0, "scattering": 0}
+    for code in inter_code[valid_mask]:
+        if not np.isfinite(code):
+            continue
+        counts = _interaction_counts(float(code))
+        if int(code) == 0:
+            totals["direct"] += 1
+        if counts["reflection"] > 0:
+            totals["reflection"] += 1
+        if counts["diffraction"] > 0:
+            totals["diffraction"] += 1
+        if counts["scattering"] > 0:
+            totals["scattering"] += 1
+    return totals
+
+
 def _infer_los_and_num_paths(inter: np.ndarray, power: np.ndarray, delay: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     num_users = power.shape[0]
     los = np.full(num_users, -1, dtype=np.int64)
@@ -554,6 +578,13 @@ def _source_group_id(d2los_root: Path, propbin_path: Path, rx_idx: int) -> str:
     return f"{d2los_root.name}-{map_name}-{source_name}-rx_{int(rx_idx)}"
 
 
+def _d2los_map_name(propbin_path: Path) -> str:
+    return next(
+        (parent.name for parent in propbin_path.parents if parent.name.startswith("map_")),
+        "map_unknown",
+    )
+
+
 def _uniform_file_allocations(
     propbin_files: list[Path],
     max_samples: int,
@@ -588,6 +619,63 @@ def _uniform_file_allocations(
     return allocations
 
 
+def _map_uniform_file_allocations(
+    propbin_files: list[Path],
+    max_samples: int,
+    max_rx_per_source: int | None,
+    seed: int,
+) -> dict[Path, int]:
+    if max_samples <= 0:
+        return {}
+    cap_per_file = max_rx_per_source if max_rx_per_source is not None else max_samples
+    if cap_per_file <= 0:
+        return {}
+
+    rng = np.random.default_rng(seed)
+    files_by_map: dict[str, list[Path]] = {}
+    for path in propbin_files:
+        files_by_map.setdefault(_d2los_map_name(path), []).append(path)
+    for files in files_by_map.values():
+        rng.shuffle(files)
+
+    map_names = list(files_by_map)
+    rng.shuffle(map_names)
+    file_offsets = {map_name: 0 for map_name in map_names}
+    allocations: dict[Path, int] = {}
+    remaining = max_samples
+
+    while remaining > 0 and map_names:
+        made_progress = False
+        for map_name in list(map_names):
+            if remaining <= 0:
+                break
+            files = files_by_map[map_name]
+            if not files:
+                map_names.remove(map_name)
+                continue
+
+            searched = 0
+            allocated = False
+            while searched < len(files):
+                file_idx = file_offsets[map_name] % len(files)
+                file_offsets[map_name] += 1
+                searched += 1
+                path = files[file_idx]
+                current = allocations.get(path, 0)
+                if current >= cap_per_file:
+                    continue
+                allocations[path] = current + 1
+                remaining -= 1
+                allocated = True
+                made_progress = True
+                break
+            if not allocated:
+                map_names.remove(map_name)
+        if not made_progress:
+            break
+    return allocations
+
+
 def load_d2los_dataset(
     d2los_root: Path,
     max_samples: int | None,
@@ -617,7 +705,7 @@ def load_d2los_dataset(
     )
     if not propbin_files:
         raise FileNotFoundError(f"No source_*.propbin(.gz) files found under {d2los_root}")
-    if sampling not in ("sequential", "uniform"):
+    if sampling not in ("sequential", "uniform", "map_uniform"):
         raise ValueError(f"Unsupported D2Los sampling mode: {sampling}")
 
     selected_subcarriers = np.arange(total_subcarriers, dtype=np.int64)
@@ -636,16 +724,22 @@ def load_d2los_dataset(
     group_ids: list[str] = []
     skipped_propbin_files = 0
     rng = np.random.default_rng(sample_seed)
-    file_allocations = (
-        _uniform_file_allocations(
-            propbin_files=propbin_files,
-            max_samples=max_samples,
-            max_rx_per_source=max_rx_per_source,
-            seed=sample_seed,
-        )
-        if sampling == "uniform" and max_samples is not None
-        else None
-    )
+    file_allocations = None
+    if max_samples is not None:
+        if sampling == "uniform":
+            file_allocations = _uniform_file_allocations(
+                propbin_files=propbin_files,
+                max_samples=max_samples,
+                max_rx_per_source=max_rx_per_source,
+                seed=sample_seed,
+            )
+        elif sampling == "map_uniform":
+            file_allocations = _map_uniform_file_allocations(
+                propbin_files=propbin_files,
+                max_samples=max_samples,
+                max_rx_per_source=max_rx_per_source,
+                seed=sample_seed,
+            )
     if file_allocations is not None:
         propbin_files = [path for path in propbin_files if file_allocations.get(path, 0) > 0]
 
@@ -893,7 +987,16 @@ def load_deepmimo_dataset(
             )
         dataset = dataset[0]
 
-    required_attrs = ("channel", "los", "num_paths", "delay", "aoa_az", "power", "ch_params")
+    required_attrs = (
+        "channel",
+        "los",
+        "num_paths",
+        "delay",
+        "aoa_az",
+        "aod_az",
+        "power",
+        "ch_params",
+    )
     missing = [name for name in required_attrs if not hasattr(dataset, name)]
     if missing:
         raise SystemExit(
@@ -951,6 +1054,72 @@ def estimate_k_factor_db(power_dbw: np.ndarray, los_flag: int) -> float:
     return float(10.0 * np.log10(los_power / nlos_power))
 
 
+def build_delay_power_map(
+    delay_s: np.ndarray,
+    power_dbw: np.ndarray,
+    valid_mask: np.ndarray,
+    delay_ns_range: tuple[float, float] = DELAY_POWER_MAP_DELAY_NS_RANGE,
+    power_dbw_range: tuple[float, float] = DELAY_POWER_MAP_POWER_DBW_RANGE,
+    map_shape: tuple[int, int] = DELAY_POWER_MAP_SHAPE,
+) -> torch.Tensor:
+    delay_bins, power_bins = map_shape
+    delay_power_map = np.zeros((delay_bins, power_bins), dtype=np.float32)
+    if not bool(valid_mask.any()):
+        return torch.from_numpy(delay_power_map)
+
+    valid_delay_ns = np.asarray(delay_s[valid_mask], dtype=np.float32) * 1e9
+    valid_power_dbw = np.asarray(power_dbw[valid_mask], dtype=np.float32)
+    power_linear = np.power(10.0, valid_power_dbw / 10.0).astype(np.float32)
+    power_sum = float(power_linear.sum())
+    if power_sum <= 0.0:
+        return torch.from_numpy(delay_power_map)
+    normalized_power = power_linear / power_sum
+
+    delay_min, delay_max = delay_ns_range
+    power_min, power_max = power_dbw_range
+    clipped_delay = np.clip(valid_delay_ns, delay_min, np.nextafter(delay_max, delay_min))
+    clipped_power = np.clip(valid_power_dbw, power_min, np.nextafter(power_max, power_min))
+    delay_idx = np.floor(
+        (clipped_delay - delay_min) / max(delay_max - delay_min, 1e-6) * delay_bins
+    ).astype(np.int64)
+    power_idx = np.floor(
+        (clipped_power - power_min) / max(power_max - power_min, 1e-6) * power_bins
+    ).astype(np.int64)
+    delay_idx = np.clip(delay_idx, 0, delay_bins - 1)
+    power_idx = np.clip(power_idx, 0, power_bins - 1)
+    np.add.at(delay_power_map, (delay_idx, power_idx), normalized_power)
+    return torch.from_numpy(delay_power_map)
+
+
+def build_delay_power_profile(
+    delay_s: np.ndarray,
+    power_dbw: np.ndarray,
+    valid_mask: np.ndarray,
+    delay_ns_range: tuple[float, float] = DELAY_POWER_MAP_DELAY_NS_RANGE,
+    num_bins: int = DELAY_POWER_PROFILE_BINS,
+) -> torch.Tensor:
+    profile = np.zeros((num_bins,), dtype=np.float32)
+    if not bool(valid_mask.any()):
+        return torch.from_numpy(profile)
+
+    valid_delay_ns = np.asarray(delay_s[valid_mask], dtype=np.float32) * 1e9
+    valid_power_dbw = np.asarray(power_dbw[valid_mask], dtype=np.float32)
+    power_linear = np.power(10.0, valid_power_dbw / 10.0).astype(np.float32)
+    power_sum = float(power_linear.sum())
+    if power_sum <= 0.0:
+        return torch.from_numpy(profile)
+    normalized_power = power_linear / power_sum
+
+    delay_min, delay_max = delay_ns_range
+    clipped_delay = np.clip(valid_delay_ns, delay_min, np.nextafter(delay_max, delay_min))
+    delay_idx = np.floor(
+        (clipped_delay - delay_min) / max(delay_max - delay_min, 1e-6) * num_bins
+    ).astype(np.int64)
+    delay_idx = np.clip(delay_idx, 0, num_bins - 1)
+    np.add.at(profile, delay_idx, normalized_power)
+    return torch.from_numpy(profile)
+
+
 def extract_semantic_observables_from_deepmimo(
     scenario: str,
     env_type: str,
@@ -958,15 +1127,24 @@ def extract_semantic_observables_from_deepmimo(
     num_paths_value: int,
     delay_s: np.ndarray,
     aoa_az_deg: np.ndarray,
+    aod_az_deg: np.ndarray,
     power_dbw: np.ndarray,
     inter_code: np.ndarray,
 ) -> dict[str, float | int | str]:
     valid = _path_mask(power_dbw, delay_s)
     n_valid_paths = int(valid.sum())
     first_path_delay = float("nan")
+    los_delay = float("nan")
+    los_aoa_az_deg = float("nan")
     first_path_power_dbw = float("nan")
     first_path_aoa_az_deg = float("nan")
+    first_path_aod_az_deg = float("nan")
     interaction_counts = {"reflection": 0, "diffraction": 0}
+    interaction_path_counts = {
+        "direct": 0,
+        "reflection": 0,
+        "diffraction": 0,
+    }
     if bool(valid.any()):
         valid_indices = np.where(valid)[0]
         first_idx = int(valid_indices[np.argmin(delay_s[valid_indices])])
@@ -974,7 +1152,16 @@ def extract_semantic_observables_from_deepmimo(
         first_path_power_dbw = float(power_dbw[first_idx])
         if np.isfinite(aoa_az_deg[first_idx]):
             first_path_aoa_az_deg = float(aoa_az_deg[first_idx])
+        if np.isfinite(aod_az_deg[first_idx]):
+            first_path_aod_az_deg = float(aod_az_deg[first_idx])
         interaction_counts = _summed_interaction_counts(inter_code, valid)
+        interaction_path_counts = _interaction_path_counts(inter_code, valid)
+        los_indices = np.where(valid & (inter_code == 0))[0]
+        if bool(los_indices.size):
+            los_idx = int(los_indices[np.argmin(delay_s[los_indices])])
+            los_delay = float(delay_s[los_idx])
+            if np.isfinite(aoa_az_deg[los_idx]):
+                los_aoa_az_deg = float(aoa_az_deg[los_idx])
 
     angle_valid = valid & np.isfinite(aoa_az_deg)
     angle_aoa_az_deg = aoa_az_deg[angle_valid]
@@ -986,6 +1173,17 @@ def extract_semantic_observables_from_deepmimo(
         power_dbw = power_dbw[:num_paths_value]
 
     power_linear = np.power(10.0, power_dbw / 10.0) if power_dbw.size else np.zeros(0)
+    total_received_power_dbw = float("nan")
+    if power_dbw.size:
+        # Stable dB-domain sum: 10*log10(sum(10**(path_power_dbw/10))).
+        strongest_power_dbw = float(np.max(power_dbw))
+        relative_power = np.power(
+            10.0,
+            (power_dbw.astype(np.float64) - strongest_power_dbw) / 10.0,
+        )
+        total_received_power_dbw = strongest_power_dbw + 10.0 * math.log10(
+            float(relative_power.sum())
+        )
     delay_spread = compute_delay_spread(delay_s, power_linear)
     angle_power_linear = (
         np.power(10.0, angle_power_dbw / 10.0)
@@ -1008,37 +1206,18 @@ def extract_semantic_observables_from_deepmimo(
         "azimuth_spread_deg": azimuth_spread_deg,
         "k_factor_db": k_factor_db,
         "first_path_delay": first_path_delay,
+        "los_delay": los_delay,
+        "los_aoa_az_deg": los_aoa_az_deg,
         "first_path_power_dbw": first_path_power_dbw,
+        "total_received_power_dbw": total_received_power_dbw,
         "first_path_aoa_az_deg": first_path_aoa_az_deg,
+        "first_path_aod_az_deg": first_path_aod_az_deg,
         "reflection_count": interaction_counts["reflection"],
         "diffraction_count": interaction_counts["diffraction"],
+        "reflection_path_count": interaction_path_counts["reflection"],
+        "diffraction_path_count": interaction_path_counts["diffraction"],
+        "direct_path_count": interaction_path_counts["direct"],
     }
-
-
-def build_semantic_key_from_deepmimo(
-    scenario: str,
-    env_type: str,
-    los_value: int,
-    num_paths_value: int,
-    delay_s: np.ndarray,
-    aoa_az_deg: np.ndarray,
-    power_dbw: np.ndarray,
-    inter_code: np.ndarray,
-) -> SemanticKey:
-    observables = extract_semantic_observables_from_deepmimo(
-        scenario=scenario,
-        env_type=env_type,
-        los_value=los_value,
-        num_paths_value=num_paths_value,
-        delay_s=delay_s,
-        aoa_az_deg=aoa_az_deg,
-        power_dbw=power_dbw,
-        inter_code=inter_code,
-    )
-
-    from data.semantic_key import build_semantic_key
-
-    return build_semantic_key(observables)
 
 
 def derive_config_info(dataset) -> tuple[str, int, int]:
@@ -1091,6 +1270,9 @@ def preprocess_deepmimo_dataset(
     bw_bin = derive_bw_bin(n_selected)
     ant_bin = derive_ant_bin(n_tx)
     array_label = 0 if array_type == "ULA" else 1
+    antenna_spacing_wavelengths = float(
+        dataset.ch_params.get("bs_antenna", {}).get("spacing", 0.5)
+    )
     n_samples = int(dataset.channel.shape[0])
     if max_samples is not None:
         n_samples = min(n_samples, max_samples)
@@ -1124,12 +1306,23 @@ def preprocess_deepmimo_dataset(
             num_paths_value=int(dataset.num_paths[idx]),
             delay_s=delay_s,
             aoa_az_deg=np.asarray(dataset.aoa_az[idx]).reshape(-1),
+            aod_az_deg=np.asarray(dataset.aod_az[idx]).reshape(-1),
             power_dbw=power_dbw,
             inter_code=np.asarray(dataset.inter[idx]).reshape(-1),
         )
         from data.semantic_key import build_semantic_key
 
         semantic_key = build_semantic_key(observables)
+        delay_power_map = build_delay_power_map(
+            delay_s=delay_s,
+            power_dbw=power_dbw,
+            valid_mask=valid_paths,
+        )
+        delay_power_profile = build_delay_power_profile(
+            delay_s=delay_s,
+            power_dbw=power_dbw,
+            valid_mask=valid_paths,
+        )
         instance_caption = caption_generator.generate_instance(
             semantic_key,
             n_paths=int(observables["n_paths"]),
@@ -1139,6 +1332,7 @@ def preprocess_deepmimo_dataset(
             first_path_delay_s=float(observables["first_path_delay"]),
             first_path_power_dbw=float(observables["first_path_power_dbw"]),
             first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
+            first_path_aod_az_deg=float(observables["first_path_aod_az_deg"]),
             reflection_count=int(observables["reflection_count"]),
             diffraction_count=int(observables["diffraction_count"]),
             config_key=config_key,
@@ -1171,10 +1365,30 @@ def preprocess_deepmimo_dataset(
                 azimuth_spread_deg=float(observables["azimuth_spread_deg"]),
                 k_factor_db=float(observables["k_factor_db"]),
                 first_path_delay_s=float(observables["first_path_delay"]),
+                los_delay_s=float(observables["los_delay"]),
+                los_aoa_az_deg=float(observables["los_aoa_az_deg"]),
                 first_path_power_dbw=float(observables["first_path_power_dbw"]),
+                total_received_power_dbw=float(observables["total_received_power_dbw"]),
                 first_path_aoa_az_deg=float(observables["first_path_aoa_az_deg"]),
+                first_path_aod_az_deg=float(observables["first_path_aod_az_deg"]),
                 reflection_count=int(observables["reflection_count"]),
                 diffraction_count=int(observables["diffraction_count"]),
+                reflection_path_count=int(observables["reflection_path_count"]),
+                diffraction_path_count=int(observables["diffraction_path_count"]),
+                direct_path_count=int(observables["direct_path_count"]),
+                delay_power_map=delay_power_map,
+                delay_power_profile=delay_power_profile,
+                array_type=array_type,
+                array_rows=n_row,
+                array_cols=n_col,
+                antenna_spacing_wavelengths=antenna_spacing_wavelengths,
+                source_n_freq=total_subcarriers,
+                bandwidth_hz=bw_hz,
+                antenna_coordinates_wavelengths=regular_array_coordinates(
+                    n_row,
+                    n_col,
+                    antenna_spacing_wavelengths,
+                ),
             )
         )
     return samples
@@ -1205,9 +1419,13 @@ def main() -> None:
     parser.add_argument(
         "--d2los-sampling",
         type=str,
-        choices=["sequential", "uniform"],
+        choices=["sequential", "uniform", "map_uniform"],
         default="sequential",
-        help="D2Los only: sequential keeps old file-order sampling; uniform spreads samples across source files.",
+        help=(
+            "D2Los only: sequential keeps old file-order sampling; uniform spreads "
+            "samples across source files; map_uniform spreads samples across maps first, "
+            "then source files."
+        ),
     )
     parser.add_argument("--d2los-sample-seed", type=int, default=0, help="D2Los uniform sampling seed.")
     parser.add_argument("--tx-shape", type=int, nargs=2, default=[8, 8], help="D2Los synthetic TX array shape.")

@@ -144,7 +144,9 @@ SLOT_VOCAB = {
         "nlos": ["non-line-of-sight", "NLoS", "obstructed"],
     },
     "richness": {
+        "any": ["unspecified"],
         "low": ["low", "sparse", "few"],
+        "moderate": ["moderate", "medium", "several"],
         "high": ["high", "rich", "many"],
     },
     "ds": {
@@ -173,6 +175,7 @@ SLOT_VOCAB = {
     },
     "first_power": {
         "unknown": ["unknown"],
+        "very_weak": ["very weak"],
         "weak": ["weak"],
         "moderate": ["moderate"],
         "strong": ["strong"],
@@ -276,6 +279,7 @@ class CaptionGenerator:
         first_path_aoa_az_deg: float,
         reflection_count: int,
         diffraction_count: int,
+        first_path_aod_az_deg: float = math.nan,
         config_key: str | None = None,
         subcarrier_spacing_hz: float | None = None,
     ) -> str:
@@ -291,7 +295,8 @@ class CaptionGenerator:
             f"K-factor {self._format_value(k_factor_db, 'dB')}. "
             f"First path delay {self._format_value(first_path_delay_s, 'ns', scale=1e9)}, "
             f"power {self._format_value(first_path_power_dbw, 'dBW')}, "
-            f"AoA {self._format_value(first_path_aoa_az_deg, 'deg')}. "
+            f"AoA {self._format_value(first_path_aoa_az_deg, 'deg')}, "
+            f"AoD {self._format_value(first_path_aod_az_deg, 'deg')}. "
             f"Interactions: {self._format_count(reflection_count)} reflections, "
             f"{self._format_count(diffraction_count)} diffractions."
             f"{spacing_clause}"
@@ -307,6 +312,7 @@ class CaptionGenerator:
             first_path_delay_s=getattr(sample, "first_path_delay_s", math.nan),
             first_path_power_dbw=getattr(sample, "first_path_power_dbw", math.nan),
             first_path_aoa_az_deg=getattr(sample, "first_path_aoa_az_deg", math.nan),
+            first_path_aod_az_deg=getattr(sample, "first_path_aod_az_deg", math.nan),
             reflection_count=getattr(sample, "reflection_count", 0),
             diffraction_count=getattr(sample, "diffraction_count", 0),
             config_key=getattr(sample, "config_key", None),

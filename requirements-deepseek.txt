@@ -1,0 +1,9 @@
+# DeepSeek-R1 Qwen3 baseline environment.
+-r requirements.txt
+
+transformers>=4.51,<5
+accelerate>=1.2,<2
+peft>=0.15,<1
+bitsandbytes>=0.45,<1
+safetensors>=0.4
+sentencepiece>=0.2,<1

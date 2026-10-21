@@ -1,0 +1,10 @@
+# Install in a separate GPU environment.
+-r requirements.txt
+
+# The local InternLM3 model card requires Transformers >= 4.48.
+transformers>=4.48,<5
+accelerate>=1.2,<2
+peft>=0.14,<0.21
+bitsandbytes>=0.45,<0.51
+sentencepiece>=0.2,<1
+safetensors>=0.4

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import random
 import sys
+import time
 from collections import Counter
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 
@@ -28,6 +32,8 @@ from data.dataset import (
     semantic_key_mode_choices,
 )
 from data.semantic_key import (
+    FIRST_POWER_DBW_BIN_LABELS,
+    FIRST_POWER_DBW_BINS,
     SemanticKey,
     default_attribute_fields,
     implied_attribute_value_filters,
@@ -37,10 +43,24 @@ from data.semantic_key import (
 )
 from data.tokenizer import CaptionTokenizer
 from models.encoder import CSIEncoder
-from models.model import CSIClip
+from models.model import (
+    CSIClip,
+    DELAY_SPREAD_BIN_LABELS,
+    DELAY_SPREAD_TAIL_LABELS,
+    FIRST_PATH_DELAY_BIN_LABELS,
+    K_FACTOR_STRONG_BIN_LABELS,
+    REFLECTION_COUNT_BIN_LABELS,
+)
 from models.text_encoder import PhysicsTextEncoder
 from training.scheduler import build_lr_scheduler
 from training.trainer import TrainConfig, Trainer
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_train_config(path: str | None) -> dict:
@@ -55,6 +75,264 @@ def load_train_config(path: str | None) -> dict:
 def cfg_get(config: dict, key: str, fallback):
     value = config.get(key, fallback)
     return fallback if value is None else value
+
+
+DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS = {
+    label: 1.0
+    for label, _, _ in FIRST_POWER_DBW_BINS
+}
+
+DEFAULT_K_FACTOR_LOSS_WEIGHTS = {
+    "weak": 1.0,
+    "strong_low": 1.0,
+    "strong_mid": 1.0,
+    "strong_high": 1.0,
+    "strong_very_high": 1.0,
+}
+
+DEFAULT_STRONG_K_BIN_WEIGHTS = {
+    label: 1.0
+    for label in K_FACTOR_STRONG_BIN_LABELS
+}
+
+DEFAULT_DELAY_SPREAD_BIN_WEIGHTS = {
+    label: 1.0
+    for label in DELAY_SPREAD_BIN_LABELS
+}
+
+DEFAULT_FIRST_PATH_DELAY_BIN_WEIGHTS = {
+    label: 1.0
+    for label in FIRST_PATH_DELAY_BIN_LABELS
+}
+
+
+def parse_first_path_power_bin_weights(value) -> dict[str, float]:
+    if value is None:
+        return dict(DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS)
+    entries = [value] if isinstance(value, str) else value
+    if isinstance(entries, dict):
+        parsed = {str(label): float(weight) for label, weight in entries.items()}
+    else:
+        parsed = dict(DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS)
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--first-path-power-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown first-path-power bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"first-path-power bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_first_path_power_bin_weights(weights: dict[str, float]) -> str:
+    return ",".join(
+        f"{label}={float(weights[label]):.3f}"
+        for label in DEFAULT_FIRST_PATH_POWER_BIN_WEIGHTS
+    )
+
+
+def parse_delay_spread_bin_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_DELAY_SPREAD_BIN_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--delay-spread-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_DELAY_SPREAD_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown delay-spread bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_DELAY_SPREAD_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"delay-spread bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_delay_spread_bin_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights.get(label, 1.0)):.3f}"
+        for label in DEFAULT_DELAY_SPREAD_BIN_WEIGHTS
+    )
+
+
+def parse_first_path_delay_bin_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_FIRST_PATH_DELAY_BIN_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--first-path-delay-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_FIRST_PATH_DELAY_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown first-path-delay bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_FIRST_PATH_DELAY_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"first-path-delay bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_first_path_delay_bin_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights.get(label, 1.0)):.3f}"
+        for label in DEFAULT_FIRST_PATH_DELAY_BIN_WEIGHTS
+    )
+
+
+def parse_first_path_delay_tail_labels(value) -> tuple[str, ...]:
+    if value is None:
+        return ("1040_1280",)
+    entries = (value,) if isinstance(value, str) else tuple(value)
+    labels = tuple(
+        label.strip()
+        for entry in entries
+        for label in str(entry).split(",")
+        if label.strip()
+    )
+    if not labels:
+        raise ValueError("estimated PDP tail labels must contain at least one label.")
+    unknown = [label for label in labels if label not in FIRST_PATH_DELAY_BIN_LABELS]
+    if unknown:
+        raise ValueError(
+            f"Unknown estimated PDP tail labels: {unknown}. "
+            f"Choose from: {', '.join(FIRST_PATH_DELAY_BIN_LABELS)}"
+        )
+    return labels
+
+
+def parse_k_factor_loss_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_K_FACTOR_LOSS_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--k-factor-loss-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_K_FACTOR_LOSS_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown K-factor loss weight labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_K_FACTOR_LOSS_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"K-factor loss weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_k_factor_loss_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights[label]):.3f}"
+        for label in DEFAULT_K_FACTOR_LOSS_WEIGHTS
+    )
+
+
+def parse_strong_k_bin_weights(value) -> dict[str, float] | None:
+    if value is None:
+        return None
+    entries = [value] if isinstance(value, str) else value
+    parsed = dict(DEFAULT_STRONG_K_BIN_WEIGHTS)
+    if isinstance(entries, dict):
+        parsed.update({str(label): float(weight) for label, weight in entries.items()})
+    else:
+        for entry in entries:
+            if "=" not in str(entry):
+                raise ValueError(
+                    "--strong-k-bin-weight entries must use LABEL=WEIGHT, "
+                    f"got {entry!r}."
+                )
+            label, raw_weight = str(entry).split("=", 1)
+            parsed[label.strip()] = float(raw_weight)
+    unknown = [label for label in parsed if label not in DEFAULT_STRONG_K_BIN_WEIGHTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown strong K-factor bin labels: {unknown}. "
+            f"Choose from: {', '.join(DEFAULT_STRONG_K_BIN_WEIGHTS)}"
+        )
+    for label, weight in parsed.items():
+        if weight <= 0.0:
+            raise ValueError(f"strong K-factor bin weight for {label!r} must be positive.")
+    return parsed
+
+
+def format_strong_k_bin_weights(weights: dict[str, float] | None) -> str:
+    if weights is None:
+        return "none"
+    return ",".join(
+        f"{label}={float(weights[label]):.3f}"
+        for label in DEFAULT_STRONG_K_BIN_WEIGHTS
+    )
+
+
+def parse_histogram_text(value: str, num_bins: int) -> list[int]:
+    if not value:
+        return [0] * num_bins
+    parts = [part for part in str(value).split(",") if part != ""]
+    if len(parts) != num_bins:
+        return [0] * num_bins
+    return [int(part) for part in parts]
+
+
+def sum_histogram_metric(
+    metrics: list[dict[str, float]],
+    key: str,
+    num_bins: int,
+) -> list[int]:
+    total = [0] * num_bins
+    for item in metrics:
+        values = parse_histogram_text(str(item.get(key, "")), num_bins)
+        total = [left + right for left, right in zip(total, values)]
+    return total
+
+
+def format_histogram_counts(labels: tuple[str, ...], counts: list[int]) -> str:
+    return ",".join(f"{label}:{count}" for label, count in zip(labels, counts))
 
 
 def parse_aux_regression_targets(value) -> tuple[str, ...]:
@@ -172,6 +450,28 @@ def format_attribute_remap(remap: dict[str, dict[str, tuple[str, ...]]]) -> str:
         + ",".join(f"{mapped}:{'|'.join(values)}" for mapped, values in mapping.items())
         for field, mapping in sorted(remap.items())
     )
+
+
+def parse_interaction_count_fields(value) -> tuple[str, ...]:
+    if value is None:
+        return ("reflection_count",)
+    if isinstance(value, str):
+        fields = tuple(part.strip() for part in value.split(",") if part.strip())
+    else:
+        fields = tuple(str(part) for part in value)
+    if not fields:
+        return ("reflection_count",)
+    unknown = [field for field in fields if field != "reflection_count"]
+    if unknown:
+        raise ValueError(
+            f"Unknown interaction_count_fields: {unknown}. "
+            "Choose from: reflection_count"
+        )
+    return fields
+
+
+def format_interaction_count_fields(fields: tuple[str, ...]) -> str:
+    return ",".join(fields) if fields else "none"
 
 
 def semantic_key_sort_key(key: SemanticKey) -> tuple[str, ...]:
@@ -325,11 +625,42 @@ def build_components_from_samples(
     device: torch.device,
     batch_size: int = 128,
     temperature: float = 0.07,
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
+    first_path_power_mode: str = "residual",
+    first_path_power_use_internal_gate: bool = True,
+    use_delay_spread_head: bool = False,
+    detach_delay_spread_features: bool = False,
+    detach_first_path_delay_features: bool = True,
+    use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
+    use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
 ):
     source_samples = samples if isinstance(samples, list) else samples.samples
+    if not source_samples:
+        raise ValueError("Cannot build a model from an empty sample collection.")
+    token_shapes = {tuple(sample.tokens.shape[1:]) for sample in source_samples}
+    if len(token_shapes) != 1:
+        raise ValueError(
+            "All training samples must use the same [d_token, n_freq] shape; "
+            f"found {sorted(token_shapes)}."
+        )
+    d_token, _ = next(iter(token_shapes))
+    if d_token <= 0 or d_token % 2 != 0:
+        raise ValueError(
+            "CSI d_token must be a positive even number containing real channels "
+            f"followed by imaginary channels; got d_token={d_token}."
+        )
     tokenizer = CaptionTokenizer()
     if tokenizer_word2id is not None:
         tokenizer.word2id = dict(tokenizer_word2id)
@@ -354,10 +685,23 @@ def build_components_from_samples(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=partial(collate_fn, tokenizer=tokenizer, max_caption_len=48),
+        drop_last=True,
+        collate_fn=partial(
+            collate_fn,
+            tokenizer=tokenizer,
+            max_caption_len=48,
+            array_token_dropout=array_token_dropout,
+            array_token_min_tokens=array_token_min_tokens,
+        ),
     )
 
-    csi_encoder = CSIEncoder(d_token=8, d_model=384, d_clip=256)
+    csi_encoder = CSIEncoder(
+        d_token=d_token,
+        d_model=384,
+        d_clip=256,
+        token_norm_mode=token_norm_mode,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+    )
     text_encoder = PhysicsTextEncoder(vocab_size=max(tokenizer.next_id + 8, 300))
     model = CSIClip(
         csi_encoder,
@@ -367,6 +711,20 @@ def build_components_from_samples(
         embed_dim=256,
         temperature=temperature,
         num_physics_targets=len(PHYSICS_TARGET_NAMES),
+        use_power_branch=use_power_branch,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+        use_delay_spread_head=use_delay_spread_head,
+        detach_delay_spread_features=detach_delay_spread_features,
+        detach_first_path_delay_features=detach_first_path_delay_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+        los_angle_context_token_norm_mode=token_norm_mode,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_num_classes={
             field: len(label_map)
             for field, label_map in attribute_label_maps.items()
@@ -395,6 +753,66 @@ def freeze_text_and_prototypes(model: CSIClip) -> None:
     freeze_module(model.text)
     if model.prototypes is not None:
         model.prototypes.requires_grad = False
+
+
+SEMANTIC_ANCHOR_MODES = (
+    "fixed",
+    "adaptive_prototypes",
+    "joint",
+)
+
+
+def semantic_anchor_freeze_policy(mode: str) -> tuple[bool, bool]:
+    """Return ``(freeze_text_encoder, freeze_prototypes)`` for an ablation mode."""
+    policies = {
+        "fixed": (True, True),
+        "adaptive_prototypes": (True, False),
+        "joint": (False, False),
+    }
+    try:
+        return policies[mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown semantic anchor mode {mode!r}; choose from: "
+            f"{', '.join(SEMANTIC_ANCHOR_MODES)}."
+        ) from exc
+
+
+def infer_semantic_anchor_mode(
+    freeze_text_encoder: bool,
+    freeze_prototypes: bool,
+) -> str:
+    for mode in SEMANTIC_ANCHOR_MODES:
+        if semantic_anchor_freeze_policy(mode) == (
+            freeze_text_encoder,
+            freeze_prototypes,
+        ):
+            return mode
+    return "custom"
+
+
+def freeze_prototype_bank(model: CSIClip) -> None:
+    if model.prototypes is not None:
+        model.prototypes.requires_grad = False
+
+
+@torch.no_grad()
+def canonical_text_features(
+    model: CSIClip,
+    prototype_token_ids: torch.Tensor,
+    prototype_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Capture normalized canonical text anchors on CPU for drift auditing."""
+    was_training = model.text.training
+    model.text.eval()
+    features = model.encode_text(
+        prototype_token_ids.to(next(model.parameters()).device),
+        prototype_token_mask.to(next(model.parameters()).device),
+        normalize=True,
+    ).detach().cpu().clone()
+    if was_training:
+        model.text.train()
+    return features
 
 
 def checkpoint_has_compatible_prototypes(
@@ -428,17 +846,12 @@ def initialize_prototypes_from_canonical_text(
 ) -> None:
     if model.prototypes is None:
         return
-    was_training = model.text.training
-    model.text.eval()
-    with torch.no_grad():
-        text_features = model.encode_text(
-            prototype_token_ids.to(next(model.parameters()).device),
-            prototype_token_mask.to(next(model.parameters()).device),
-            normalize=True,
-        )
-        model.initialize_prototypes(text_features, normalize=False)
-    if was_training:
-        model.text.train()
+    text_features = canonical_text_features(
+        model,
+        prototype_token_ids,
+        prototype_token_mask,
+    )
+    model.initialize_prototypes(text_features, normalize=False)
 
 
 def trainable_parameters(model: torch.nn.Module):
@@ -447,6 +860,55 @@ def trainable_parameters(model: torch.nn.Module):
 
 def count_trainable_parameters(model: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def build_runtime_metadata(
+    *,
+    model: torch.nn.Module,
+    device: torch.device,
+    seed: int,
+) -> dict[str, int | str | bool | None]:
+    cuda_available = torch.cuda.is_available()
+    gpu_name = "none"
+    gpu_count = 0
+    cuda_device_capability = "none"
+    if cuda_available:
+        gpu_count = torch.cuda.device_count()
+        device_index = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(device_index)
+        cuda_device_capability = ".".join(
+            str(part) for part in torch.cuda.get_device_capability(device_index)
+        )
+    return {
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "none",
+        "cudnn_version": torch.backends.cudnn.version(),
+        "cuda_available": cuda_available,
+        "gpu_name": gpu_name,
+        "gpu_count": gpu_count,
+        "cuda_device_capability": cuda_device_capability,
+        "device": str(device),
+        "seed": seed,
+        "amp_enabled": False,
+        "model_parameters": count_parameters(model),
+        "model_trainable_parameters": count_trainable_parameters(model),
+    }
+
+
+def print_runtime_metadata(metadata: dict[str, int | str | bool | None]) -> None:
+    for key, value in metadata.items():
+        print(f"{key}={value}")
 
 
 def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | None:
@@ -458,13 +920,34 @@ def load_transfer_checkpoint(path: str | None, device: torch.device) -> dict | N
     return torch.load(checkpoint_path, map_location=device, weights_only=False)
 
 
+def checkpoint_first_path_delay_bin_label_mismatch(checkpoint: dict) -> bool:
+    checkpoint_labels = checkpoint.get("args", {}).get("first_path_delay_bin_label_order")
+    if checkpoint_labels is None:
+        return False
+    return tuple(checkpoint_labels) != tuple(FIRST_PATH_DELAY_BIN_LABELS)
+
+
 def load_model_state_compatible(model: torch.nn.Module, checkpoint: dict) -> None:
     state_dict = checkpoint["model_state"]
     model_state = model.state_dict()
+    skip_prefixes: tuple[str, ...] = ()
+    if checkpoint_first_path_delay_bin_label_mismatch(checkpoint):
+        skip_prefixes = (
+            "first_path_delay_bin_classifier.",
+            "first_path_delay_bin_position_head.",
+        )
+        print(
+            "checkpoint first-path-delay bin labels differ from current labels; "
+            "skipping first_path_delay_bin_classifier and first_path_delay_bin_position_head."
+        )
     compatible_state = {
         name: value
         for name, value in state_dict.items()
-        if name in model_state and model_state[name].shape == value.shape
+        if (
+            name in model_state
+            and model_state[name].shape == value.shape
+            and not name.startswith(skip_prefixes)
+        )
     }
     skipped = sorted(set(state_dict) - set(compatible_state))
     missing = sorted(set(model_state) - set(compatible_state))
@@ -551,9 +1034,63 @@ def limit_samples_by_attribute_value_for_debug(
     return limited
 
 
+def _sample_delay_spread_ns(sample) -> float:
+    scale = 1.0
+    if hasattr(sample, "delay_spread_ns"):
+        value = getattr(sample, "delay_spread_ns")
+    elif hasattr(sample, "delay_spread_s"):
+        value = getattr(sample, "delay_spread_s")
+        scale = 1e9
+    elif hasattr(sample, "delay_spread"):
+        value = getattr(sample, "delay_spread")
+        scale = 1e9
+    else:
+        return math.nan
+    try:
+        value = float(value) * scale
+    except (TypeError, ValueError):
+        return math.nan
+    return value if math.isfinite(value) else math.nan
+
+
+def filter_samples_by_max_delay_spread(samples, max_delay_spread_ns: float | None):
+    if max_delay_spread_ns is None:
+        return samples
+    if max_delay_spread_ns <= 0.0:
+        raise ValueError("max_delay_spread_ns must be positive.")
+    filtered = []
+    for sample in samples:
+        delay_spread_ns = _sample_delay_spread_ns(sample)
+        if math.isfinite(delay_spread_ns) and delay_spread_ns < max_delay_spread_ns:
+            filtered.append(sample)
+    if not filtered:
+        raise ValueError(
+            "No samples remain after applying "
+            f"max_delay_spread_ns={max_delay_spread_ns}."
+        )
+    return filtered
+
+
 def build_demo_components(
     device: torch.device,
     semantic_key_mode: str = "full",
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
+    first_path_power_mode: str = "residual",
+    first_path_power_use_internal_gate: bool = True,
+    use_delay_spread_head: bool = False,
+    detach_delay_spread_features: bool = False,
+    detach_first_path_delay_features: bool = True,
+    use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
+    use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     attribute_fields: tuple[str, ...] = (),
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ):
@@ -568,6 +1105,23 @@ def build_demo_components(
         samples,
         device=device,
         batch_size=32,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+        use_delay_spread_head=use_delay_spread_head,
+        detach_delay_spread_features=detach_delay_spread_features,
+        detach_first_path_delay_features=detach_first_path_delay_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
     )
@@ -576,8 +1130,26 @@ def build_demo_components(
 def build_real_components(
     data_path: str,
     device: torch.device,
+    additional_data_paths: tuple[str, ...] = (),
     batch_size: int = 128,
     temperature: float = 0.07,
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
+    first_path_power_mode: str = "residual",
+    first_path_power_use_internal_gate: bool = True,
+    use_delay_spread_head: bool = False,
+    detach_delay_spread_features: bool = False,
+    detach_first_path_delay_features: bool = True,
+    use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
+    use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
     min_class_size: int = 1,
     semantic_key_mode: str = "full",
     attribute_fields: tuple[str, ...] = (),
@@ -586,9 +1158,23 @@ def build_real_components(
     limit_samples: int | None = None,
     limit_samples_by_attribute: str | None = None,
     limit_samples_per_attribute_value: int | None = None,
+    max_delay_spread_ns: float | None = None,
     tokenizer_word2id: dict[str, int] | None = None,
 ):
-    dataset = PreprocessedCSIDataset.from_pt(data_path)
+    data_paths = (data_path, *additional_data_paths)
+    source_samples = []
+    for source_path in data_paths:
+        source_dataset = PreprocessedCSIDataset.from_pt(source_path)
+        print(
+            f"joint_training_source={source_path} "
+            f"samples={len(source_dataset.samples)}"
+        )
+        source_samples.extend(source_dataset.samples)
+    dataset = PreprocessedCSIDataset(source_samples)
+    print(
+        f"joint_training_sources={len(data_paths)} "
+        f"combined_samples={len(dataset.samples)}"
+    )
     mode_samples = apply_semantic_key_mode(dataset.samples, semantic_key_mode)
     if semantic_key_mode != "full":
         before_counts = Counter(sample.semantic_key for sample in dataset.samples)
@@ -634,6 +1220,19 @@ def build_real_components(
             f"value_counts={value_count_text}"
         )
     samples = value_filtered_samples
+    delay_filtered_samples = filter_samples_by_max_delay_spread(
+        samples,
+        max_delay_spread_ns,
+    )
+    if len(delay_filtered_samples) != len(samples):
+        before_counts = Counter(sample.semantic_key for sample in samples)
+        after_counts = Counter(sample.semantic_key for sample in delay_filtered_samples)
+        print(
+            f"filtered samples by max_delay_spread_ns={max_delay_spread_ns}: "
+            f"samples {len(samples)} -> {len(delay_filtered_samples)}, "
+            f"semantic_prototypes {len(before_counts)} -> {len(after_counts)}"
+        )
+    samples = delay_filtered_samples
     balanced_limited_samples = limit_samples_by_attribute_value_for_debug(
         samples,
         limit_samples_by_attribute,
@@ -678,6 +1277,23 @@ def build_real_components(
         device=device,
         batch_size=batch_size,
         temperature=temperature,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+        use_delay_spread_head=use_delay_spread_head,
+        detach_delay_spread_features=detach_delay_spread_features,
+        detach_first_path_delay_features=detach_first_path_delay_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_fields,
         attribute_remap=attribute_remap,
         tokenizer_word2id=tokenizer_word2id,
@@ -688,6 +1304,8 @@ def run_smoke_test(
     device: torch.device,
     text_mode: str = "prototype",
     csi_to_text_weight: float = 1.0,
+    prototype_weight: float = 1.0,
+    text_prototype_weight: float = 1.0,
     semantic_classifier_weight: float = 0.0,
     semantic_classifier_class_weight: str = "none",
     semantic_classifier_logit_adjustment: float = 0.0,
@@ -696,19 +1314,114 @@ def run_smoke_test(
     attribute_classifier_class_weight: str = "none",
     attribute_classifier_logit_adjustment: float = 0.0,
     aux_regression_weight: float = 0.0,
+    first_path_aod_weight: float = 0.0,
+    first_path_aod_nlos_weight: float = 0.0,
     aux_regression_targets: tuple[str, ...] = ("all",),
+    k_factor_loss_weights: dict[str, float] | None = None,
+    strong_k_bin_classifier_weight: float = 0.0,
+    strong_k_position_weight: float = 0.0,
+    strong_k_bin_weights: dict[str, float] | None = None,
+    direct_power_weight: float = 0.0,
+    delay_spread_weight: float = 0.0,
+    delay_spread_raw_weight: float = 0.0,
+    delay_spread_raw_beta_ns: float = 20.0,
+    first_path_delay_weight: float = 0.0,
+    first_path_delay_raw_weight: float = 0.0,
+    first_path_delay_fused_raw_weight: float = 0.0,
+    first_path_delay_raw_beta_ns: float = 20.0,
+    first_path_delay_bin_classifier_weight: float = 0.0,
+    first_path_delay_bin_position_weight: float = 0.0,
+    first_path_delay_bin_consistency_weight: float = 0.0,
+    first_path_delay_bin_weights: dict[str, float] | None = None,
+    estimated_pdp_tail_bin_weight: float = 0.0,
+    estimated_pdp_tail_labels: tuple[str, ...] = ("1040_1280",),
+    estimated_pdp_tail_gate_mode: str = "target",
+    first_path_delay_tail_underestimate_weight: float = 0.0,
+    los_delay_weight: float = 0.0,
+    los_delay_nonnegative_weight: float = 0.0,
+    use_physics_calibration_loss: bool = False,
+    los_delay_consistency_weight: float = 0.0,
+    los_angle_weight: float = 0.0,
+    first_path_angle_weight: float = 0.0,
+    first_path_angle_nlos_weight: float = 0.0,
+    delay_spread_teacher_weight: float = 0.1,
+    delay_spread_bin_weights: dict[str, float] | None = None,
+    delay_spread_bin_classifier_weight: float = 0.0,
+    delay_spread_bin_position_weight: float = 0.0,
+    delay_spread_tail_classifier_weight: float = 0.0,
+    interaction_count_classifier_weight: float = 0.0,
+    interaction_count_regression_weight: float = 0.0,
+    reflection_count_classifier_weight: float = 0.0,
+    reflection_count_regression_weight: float = 0.0,
+    reflection_path_count_regression_weight: float = 0.0,
+    reflection_count_nlos_weight: float = 1.0,
+    interaction_count_soft_labels: bool = False,
+    physics_relational_weight: float = 0.0,
+    interaction_count_fields: tuple[str, ...] = ("reflection_count",),
+    first_path_power_bin_classifier_weight: float = 0.0,
+    first_path_power_bin_position_weight: float = 0.0,
+    first_path_power_bin_weights: dict[str, float] | None = None,
+    first_path_power_nlos_weight: float = 1.0,
+    first_path_power_gate_mode: str = "none",
+    first_path_power_mode: str = "residual",
+    first_path_power_use_internal_gate: bool = True,
+    nlos_enhanced_power_loss: bool = False,
+    first_path_power_delta_limit: float = 0.5,
     multipositive_distance_threshold: float = 0.25,
     multipositive_positive_mode: str = "semantic_and_physics",
     min_class_size_for_multipositive: int = 2,
     semantic_key_mode: str = "full",
+    token_norm_mode: str = "std",
+    use_power_branch: bool = False,
+    detach_delay_spread_features: bool = False,
+    detach_first_path_delay_features: bool = True,
+    use_delay_specific_encoder: bool = False,
+    use_array_invariant_delay_encoder: bool = False,
+    use_continuous_config_encoding: bool = False,
+    array_token_dropout: float = 0.0,
+    array_token_min_tokens: int = 4,
+    use_los_angle_context_encoder: bool = False,
+    use_first_path_angle_context_encoder: bool = False,
+    use_first_path_aod_context_encoder: bool = False,
+    use_shared_physics_token: bool = False,
+    shared_physics_token_residual_scale: float = 1.0,
+    noise_augmentation_enabled: bool = False,
+    noise_augmentation_probability: float = 0.0,
+    noise_snr_min_db: float = 10.0,
+    noise_snr_max_db: float = 30.0,
+    noise_augmented_main_weight: float = 0.0,
+    noise_delay_consistency_weight: float = 0.0,
+    noise_delay_spread_supervised_weight: float = 0.0,
+    noise_delay_spread_consistency_weight: float = 0.0,
+    noise_k_consistency_weight: float = 0.0,
+    noise_clean_k_supervised_weight: float = 0.0,
+    noise_noisy_k_supervised_weight: float = 0.0,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]] | None = None,
 ) -> None:
     loader, model, _, prototype_bank = build_demo_components(
         device,
         semantic_key_mode=semantic_key_mode,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+        use_delay_spread_head=delay_spread_weight > 0.0 or delay_spread_raw_weight > 0.0,
+        detach_delay_spread_features=detach_delay_spread_features,
+        detach_first_path_delay_features=detach_first_path_delay_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         attribute_fields=attribute_classifier_fields,
         attribute_remap=attribute_remap,
     )
+    model.first_path_power_delta_limit = float(first_path_power_delta_limit)
     initialize_prototypes_from_canonical_text(
         model,
         prototype_bank["token_ids"],
@@ -738,6 +1451,8 @@ def run_smoke_test(
                     epochs=2,
                     text_mode=text_mode,
                     csi_to_text_weight=csi_to_text_weight,
+                    prototype_weight=prototype_weight,
+                    text_prototype_weight=text_prototype_weight,
                     semantic_classifier_weight=semantic_classifier_weight,
                     semantic_classifier_class_weight=semantic_classifier_class_weight,
                     semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
@@ -745,11 +1460,80 @@ def run_smoke_test(
                     attribute_classifier_class_weight=attribute_classifier_class_weight,
                     attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
                     aux_regression_weight=aux_regression_weight,
+                    first_path_aod_weight=first_path_aod_weight,
+                    first_path_aod_nlos_weight=first_path_aod_nlos_weight,
                     aux_regression_indices=aux_regression_indices(aux_regression_targets),
-                    prototype_warmup_epochs=1,
+                    k_factor_loss_weights=k_factor_loss_weights,
+                    strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+                    strong_k_position_weight=strong_k_position_weight,
+                    strong_k_bin_weights=strong_k_bin_weights,
+                    first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+                    first_path_power_bin_position_weight=first_path_power_bin_position_weight,
+                    direct_power_weight=direct_power_weight,
+                    delay_spread_weight=delay_spread_weight,
+                    delay_spread_raw_weight=delay_spread_raw_weight,
+                    delay_spread_raw_beta_ns=delay_spread_raw_beta_ns,
+                    first_path_delay_weight=first_path_delay_weight,
+                    first_path_delay_raw_weight=first_path_delay_raw_weight,
+                    first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
+                    first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
+                    first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
+                    first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
+                    first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
+                    first_path_delay_bin_weights=first_path_delay_bin_weights,
+                    estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+                    estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+                    estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+                    first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
+                    los_delay_weight=los_delay_weight,
+                    los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+                    use_physics_calibration_loss=use_physics_calibration_loss,
+                    los_delay_consistency_weight=los_delay_consistency_weight,
+                    los_angle_weight=los_angle_weight,
+                    first_path_angle_weight=first_path_angle_weight,
+                    first_path_angle_nlos_weight=first_path_angle_nlos_weight,
+                    delay_spread_teacher_weight=delay_spread_teacher_weight,
+                    delay_spread_bin_weights=delay_spread_bin_weights,
+                    delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+                    delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+                    delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+                    interaction_count_classifier_weight=interaction_count_classifier_weight,
+                    interaction_count_regression_weight=interaction_count_regression_weight,
+                    reflection_count_classifier_weight=reflection_count_classifier_weight,
+                    reflection_count_regression_weight=reflection_count_regression_weight,
+                    reflection_path_count_regression_weight=reflection_path_count_regression_weight,
+                    reflection_count_nlos_weight=reflection_count_nlos_weight,
+                    interaction_count_soft_labels=interaction_count_soft_labels,
+                    physics_relational_weight=physics_relational_weight,
+                    first_path_power_bin_weights=first_path_power_bin_weights,
+                    first_path_power_nlos_weight=first_path_power_nlos_weight,
+                    first_path_power_gate_mode=first_path_power_gate_mode,
+                    first_path_power_mode=first_path_power_mode,
+                    first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+                    nlos_enhanced_power_loss=nlos_enhanced_power_loss,
+                    prototype_warmup_epochs=(
+                        0
+                        if (
+                            csi_to_text_weight == 0.0
+                            and prototype_weight == 0.0
+                            and text_prototype_weight == 0.0
+                        )
+                        else 1
+                    ),
                     multipositive_distance_threshold=multipositive_distance_threshold,
                     multipositive_positive_mode=multipositive_positive_mode,
                     min_class_size_for_multipositive=min_class_size_for_multipositive,
+                    noise_augmentation_enabled=noise_augmentation_enabled,
+                    noise_augmentation_probability=noise_augmentation_probability,
+                    noise_snr_min_db=noise_snr_min_db,
+                    noise_snr_max_db=noise_snr_max_db,
+                    noise_augmented_main_weight=noise_augmented_main_weight,
+                    noise_delay_consistency_weight=noise_delay_consistency_weight,
+                    noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+                    noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
+                    noise_k_consistency_weight=noise_k_consistency_weight,
+                    noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+                    noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
                 ),
             )
             print(
@@ -762,6 +1546,7 @@ def run_smoke_test(
 
 def run_real_pretrain(
     data_path: str,
+    additional_data_paths: tuple[str, ...],
     checkpoint_path: str | None,
     device: torch.device,
     epochs: int,
@@ -770,6 +1555,20 @@ def run_real_pretrain(
     weight_decay: float,
     batch_size: int,
     temperature: float,
+    token_norm_mode: str,
+    use_power_branch: bool,
+    detach_delay_spread_features: bool,
+    detach_first_path_delay_features: bool,
+    use_delay_specific_encoder: bool,
+    use_array_invariant_delay_encoder: bool,
+    use_continuous_config_encoding: bool,
+    array_token_dropout: float,
+    array_token_min_tokens: int,
+    use_los_angle_context_encoder: bool,
+    use_first_path_angle_context_encoder: bool,
+    use_first_path_aod_context_encoder: bool,
+    use_shared_physics_token: bool,
+    shared_physics_token_residual_scale: float,
     warmup_epochs: int,
     min_lr: float,
     prototype_weight: float,
@@ -785,10 +1584,73 @@ def run_real_pretrain(
     attribute_classifier_class_weight: str,
     attribute_classifier_logit_adjustment: float,
     aux_regression_weight: float,
+    first_path_aod_weight: float,
+    first_path_aod_nlos_weight: float,
     aux_regression_targets: tuple[str, ...],
+    k_factor_loss_weights: dict[str, float] | None,
+    strong_k_bin_classifier_weight: float,
+    strong_k_position_weight: float,
+    strong_k_bin_weights: dict[str, float] | None,
+    first_path_power_bin_classifier_weight: float,
+    first_path_power_bin_position_weight: float,
+    direct_power_weight: float,
+    nlos_enhanced_power_loss: bool,
+    first_path_power_delta_limit: float,
+    first_path_power_mode: str,
+    first_path_power_use_internal_gate: bool,
+    delay_spread_weight: float,
+    first_path_delay_weight: float,
+    first_path_delay_raw_weight: float,
+    first_path_delay_fused_raw_weight: float,
+    first_path_delay_raw_beta_ns: float,
+    first_path_delay_bin_classifier_weight: float,
+    first_path_delay_bin_position_weight: float,
+    first_path_delay_bin_consistency_weight: float,
+    first_path_delay_bin_weights: dict[str, float] | None,
+    estimated_pdp_tail_bin_weight: float,
+    estimated_pdp_tail_labels: tuple[str, ...],
+    estimated_pdp_tail_gate_mode: str,
+    first_path_delay_tail_underestimate_weight: float,
+    los_delay_weight: float,
+    los_delay_nonnegative_weight: float,
+    use_physics_calibration_loss: bool,
+    los_delay_consistency_weight: float,
+    los_angle_weight: float,
+    first_path_angle_weight: float,
+    first_path_angle_nlos_weight: float,
+    delay_spread_raw_weight: float,
+    delay_spread_raw_beta_ns: float,
+    delay_spread_teacher_weight: float,
+    delay_spread_bin_weights: dict[str, float] | None,
+    delay_spread_bin_classifier_weight: float,
+    delay_spread_bin_position_weight: float,
+    delay_spread_tail_classifier_weight: float,
+    interaction_count_classifier_weight: float,
+    interaction_count_regression_weight: float,
+    reflection_count_classifier_weight: float,
+    reflection_count_regression_weight: float,
+    reflection_path_count_regression_weight: float,
+    reflection_count_nlos_weight: float,
+    interaction_count_soft_labels: bool,
+    physics_relational_weight: float,
+    interaction_count_fields: tuple[str, ...],
+    first_path_power_bin_weights: dict[str, float],
+    first_path_power_nlos_weight: float,
+    first_path_power_gate_mode: str,
     multipositive_distance_threshold: float,
     multipositive_positive_mode: str,
     min_class_size_for_multipositive: int,
+    noise_augmentation_enabled: bool,
+    noise_augmentation_probability: float,
+    noise_snr_min_db: float,
+    noise_snr_max_db: float,
+    noise_augmented_main_weight: float,
+    noise_delay_consistency_weight: float,
+    noise_delay_spread_supervised_weight: float,
+    noise_delay_spread_consistency_weight: float,
+    noise_k_consistency_weight: float,
+    noise_clean_k_supervised_weight: float,
+    noise_noisy_k_supervised_weight: float,
     min_class_size: int,
     semantic_key_mode: str,
     attribute_remap: dict[str, dict[str, tuple[str, ...]]],
@@ -796,8 +1658,13 @@ def run_real_pretrain(
     limit_samples: int | None,
     limit_samples_by_attribute: str | None,
     limit_samples_per_attribute_value: int | None,
+    max_delay_spread_ns: float | None,
+    allow_prototype_mismatch_transfer: bool,
     freeze_csi: bool,
-    freeze_text_prototypes: bool,
+    freeze_text_encoder: bool,
+    freeze_prototypes: bool,
+    semantic_anchor_mode: str,
+    seed: int,
     output_dir: str,
     save_every: int,
 ) -> None:
@@ -808,9 +1675,27 @@ def run_real_pretrain(
     }
     loader, model, tokenizer, prototype_bank = build_real_components(
         data_path=data_path,
+        additional_data_paths=additional_data_paths,
         device=device,
         batch_size=batch_size,
         temperature=temperature,
+        token_norm_mode=token_norm_mode,
+        use_power_branch=use_power_branch,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+        use_delay_spread_head=delay_spread_weight > 0.0 or delay_spread_raw_weight > 0.0,
+        detach_delay_spread_features=detach_delay_spread_features,
+        detach_first_path_delay_features=detach_first_path_delay_features,
+        use_delay_specific_encoder=use_delay_specific_encoder,
+        use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+        use_continuous_config_encoding=use_continuous_config_encoding,
+        array_token_dropout=array_token_dropout,
+        array_token_min_tokens=array_token_min_tokens,
+        use_los_angle_context_encoder=use_los_angle_context_encoder,
+        use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+        use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+        use_shared_physics_token=use_shared_physics_token,
+        shared_physics_token_residual_scale=shared_physics_token_residual_scale,
         min_class_size=min_class_size,
         semantic_key_mode=semantic_key_mode,
         attribute_fields=attribute_classifier_fields,
@@ -819,19 +1704,40 @@ def run_real_pretrain(
         limit_samples=limit_samples,
         limit_samples_by_attribute=limit_samples_by_attribute,
         limit_samples_per_attribute_value=limit_samples_per_attribute_value,
+        max_delay_spread_ns=max_delay_spread_ns,
         tokenizer_word2id=(
             transfer_checkpoint.get("tokenizer_word2id")
             if transfer_checkpoint is not None
             else None
         ),
     )
-    if transfer_checkpoint is not None:
-        assert_checkpoint_prototype_compatibility(
-            transfer_checkpoint,
-            prototype_bank["keys"],
-            expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
-            context="transfer checkpoint",
+    if first_path_aod_weight > 0.0 or first_path_aod_nlos_weight > 0.0:
+        aod_label_count = sum(
+            math.isfinite(float(getattr(sample, "first_path_aod_az_deg", math.nan)))
+            for sample in loader.dataset.samples
         )
+        print(f"first_path_aod_label_count={aod_label_count}/{len(loader.dataset.samples)}")
+        if aod_label_count == 0:
+            raise ValueError(
+                "AoD supervision is enabled, but the training split has no finite "
+                "first_path_aod_az_deg labels. Regenerate the AoD data pool first."
+            )
+    model.first_path_power_delta_limit = float(first_path_power_delta_limit)
+    if transfer_checkpoint is not None:
+        try:
+            assert_checkpoint_prototype_compatibility(
+                transfer_checkpoint,
+                prototype_bank["keys"],
+                expected_shape=tuple(model.prototypes.shape) if model.prototypes is not None else None,
+                context="transfer checkpoint",
+            )
+        except ValueError:
+            if not allow_prototype_mismatch_transfer:
+                raise
+            print(
+                "allowing prototype-mismatch transfer: compatible checkpoint weights "
+                "will be loaded and current prototypes will be reinitialized from text."
+            )
     if transfer_checkpoint is not None:
         load_model_state_compatible(model, transfer_checkpoint)
     if not checkpoint_has_compatible_prototypes(model, transfer_checkpoint, prototype_bank["keys"]):
@@ -840,10 +1746,27 @@ def run_real_pretrain(
             prototype_bank["token_ids"],
             prototype_bank["token_mask"],
         )
+    initial_text_features = canonical_text_features(
+        model,
+        prototype_bank["token_ids"],
+        prototype_bank["token_mask"],
+    )
+    if transfer_checkpoint is not None:
+        saved_initial_text_features = transfer_checkpoint.get(
+            "prototype_initial_text_features"
+        )
+        if (
+            isinstance(saved_initial_text_features, torch.Tensor)
+            and tuple(saved_initial_text_features.shape)
+            == tuple(initial_text_features.shape)
+        ):
+            initial_text_features = saved_initial_text_features.detach().cpu().clone()
     if freeze_csi:
         freeze_module(model.csi)
-    if freeze_text_prototypes:
-        freeze_text_and_prototypes(model)
+    if freeze_text_encoder:
+        freeze_module(model.text)
+    if freeze_prototypes:
+        freeze_prototype_bank(model)
     optimizer_parameters = trainable_parameters(model)
     if not optimizer_parameters:
         raise ValueError("No trainable parameters remain after applying freeze options.")
@@ -870,12 +1793,75 @@ def run_real_pretrain(
         attribute_classifier_class_weight=attribute_classifier_class_weight,
         attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
         aux_regression_weight=aux_regression_weight,
+        first_path_aod_weight=first_path_aod_weight,
+        first_path_aod_nlos_weight=first_path_aod_nlos_weight,
         aux_regression_indices=aux_regression_indices(aux_regression_targets),
+        k_factor_loss_weights=k_factor_loss_weights,
+        strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+        strong_k_position_weight=strong_k_position_weight,
+        strong_k_bin_weights=strong_k_bin_weights,
+        first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+        first_path_power_bin_position_weight=first_path_power_bin_position_weight,
+        direct_power_weight=direct_power_weight,
+        delay_spread_weight=delay_spread_weight,
+        delay_spread_raw_weight=delay_spread_raw_weight,
+        delay_spread_raw_beta_ns=delay_spread_raw_beta_ns,
+        first_path_delay_weight=first_path_delay_weight,
+        first_path_delay_raw_weight=first_path_delay_raw_weight,
+        first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
+        first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
+        first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
+        first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
+        first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
+        first_path_delay_bin_weights=first_path_delay_bin_weights,
+        estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+        estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+        estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+        first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
+        los_delay_weight=los_delay_weight,
+        los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+        use_physics_calibration_loss=use_physics_calibration_loss,
+        los_delay_consistency_weight=los_delay_consistency_weight,
+        los_angle_weight=los_angle_weight,
+        first_path_angle_weight=first_path_angle_weight,
+        first_path_angle_nlos_weight=first_path_angle_nlos_weight,
+        delay_spread_teacher_weight=delay_spread_teacher_weight,
+        delay_spread_bin_weights=delay_spread_bin_weights,
+        delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+        delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+        delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+        interaction_count_classifier_weight=interaction_count_classifier_weight,
+        interaction_count_regression_weight=interaction_count_regression_weight,
+        reflection_count_classifier_weight=reflection_count_classifier_weight,
+        reflection_count_regression_weight=reflection_count_regression_weight,
+        reflection_path_count_regression_weight=reflection_path_count_regression_weight,
+        reflection_count_nlos_weight=reflection_count_nlos_weight,
+        interaction_count_soft_labels=interaction_count_soft_labels,
+        physics_relational_weight=physics_relational_weight,
+        first_path_power_bin_weights=first_path_power_bin_weights,
+        first_path_power_nlos_weight=first_path_power_nlos_weight,
+        first_path_power_gate_mode=first_path_power_gate_mode,
+        first_path_power_mode=first_path_power_mode,
+        first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+        nlos_enhanced_power_loss=nlos_enhanced_power_loss,
         freeze_csi=freeze_csi,
-        freeze_text_prototypes=freeze_text_prototypes,
+        freeze_text_encoder=freeze_text_encoder,
+        freeze_prototypes=freeze_prototypes,
+        freeze_text_prototypes=freeze_text_encoder and freeze_prototypes,
         multipositive_distance_threshold=multipositive_distance_threshold,
         multipositive_positive_mode=multipositive_positive_mode,
         min_class_size_for_multipositive=min_class_size_for_multipositive,
+        noise_augmentation_enabled=noise_augmentation_enabled,
+        noise_augmentation_probability=noise_augmentation_probability,
+        noise_snr_min_db=noise_snr_min_db,
+        noise_snr_max_db=noise_snr_max_db,
+        noise_augmented_main_weight=noise_augmented_main_weight,
+        noise_delay_consistency_weight=noise_delay_consistency_weight,
+        noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+        noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
+        noise_k_consistency_weight=noise_k_consistency_weight,
+        noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+        noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
     )
     trainer = Trainer(
         model,
@@ -889,12 +1875,24 @@ def run_real_pretrain(
         attribute_class_counts=prototype_bank["attribute_class_counts"],
         attribute_remap=attribute_remap,
     )
-
     print(f"training on {data_path}")
+    print(f"additional_training_data={','.join(additional_data_paths) or 'none'}")
     print(f"checkpoint={checkpoint_path}")
     print(
         f"device={device} epochs={epochs} batch_size={batch_size} "
-        f"temperature={temperature} warmup_epochs={warmup_epochs} min_lr={min_lr}"
+        f"temperature={temperature} token_norm_mode={token_norm_mode} "
+        f"use_power_branch={use_power_branch} "
+        f"detach_delay_spread_features={detach_delay_spread_features} "
+        f"detach_first_path_delay_features={detach_first_path_delay_features} "
+        f"use_delay_specific_encoder={use_delay_specific_encoder} "
+        f"use_array_invariant_delay_encoder={use_array_invariant_delay_encoder} "
+        f"use_continuous_config_encoding={use_continuous_config_encoding} "
+        f"array_token_dropout={array_token_dropout:.4f} "
+        f"array_token_min_tokens={array_token_min_tokens} "
+        f"use_los_angle_context_encoder={use_los_angle_context_encoder} "
+        f"use_first_path_angle_context_encoder={use_first_path_angle_context_encoder} "
+        f"use_first_path_aod_context_encoder={use_first_path_aod_context_encoder} "
+        f"warmup_epochs={warmup_epochs} min_lr={min_lr}"
     )
     print(
         f"semantic_prototypes={len(prototype_bank['keys'])} "
@@ -911,22 +1909,100 @@ def run_real_pretrain(
         f"attribute_classifier_logit_adjustment={attribute_classifier_logit_adjustment} "
         f"attribute_remap={format_attribute_remap(attribute_remap)} "
         f"aux_regression_weight={aux_regression_weight} "
+        f"first_path_aod_weight={first_path_aod_weight} "
+        f"first_path_aod_nlos_weight={first_path_aod_nlos_weight} "
         f"aux_regression_targets={','.join(aux_regression_targets)} "
+        f"k_factor_loss_weights={format_k_factor_loss_weights(k_factor_loss_weights)} "
+        f"strong_k_bin_classifier_weight={strong_k_bin_classifier_weight} "
+        f"strong_k_position_weight={strong_k_position_weight} "
+        f"strong_k_bin_weights={format_strong_k_bin_weights(strong_k_bin_weights)} "
+        f"strong_k_bin_label_order={','.join(K_FACTOR_STRONG_BIN_LABELS)} "
+        f"first_path_power_bin_classifier_weight={first_path_power_bin_classifier_weight} "
+        f"first_path_power_bin_position_weight={first_path_power_bin_position_weight} "
+        f"first_path_power_bin_label_order={','.join(FIRST_POWER_DBW_BIN_LABELS)} "
+        f"direct_power_weight={direct_power_weight} "
+        f"first_path_power_gate_mode={first_path_power_gate_mode} "
+        f"first_path_power_mode={first_path_power_mode} "
+        f"first_path_power_use_internal_gate={first_path_power_use_internal_gate} "
+        f"nlos_enhanced_power_loss={nlos_enhanced_power_loss} "
+        f"first_path_power_delta_limit={first_path_power_delta_limit} "
+        f"delay_spread_weight={delay_spread_weight} "
+        f"delay_spread_raw_weight={delay_spread_raw_weight} "
+        f"delay_spread_raw_beta_ns={delay_spread_raw_beta_ns} "
+        f"first_path_delay_weight={first_path_delay_weight} "
+        f"first_path_delay_raw_weight={first_path_delay_raw_weight} "
+        f"first_path_delay_fused_raw_weight={first_path_delay_fused_raw_weight} "
+        f"first_path_delay_raw_beta_ns={first_path_delay_raw_beta_ns} "
+        f"first_path_delay_bin_classifier_weight={first_path_delay_bin_classifier_weight} "
+        f"first_path_delay_bin_position_weight={first_path_delay_bin_position_weight} "
+        f"first_path_delay_bin_consistency_weight={first_path_delay_bin_consistency_weight} "
+        f"first_path_delay_bin_weights={format_first_path_delay_bin_weights(first_path_delay_bin_weights)} "
+        f"estimated_pdp_tail_bin_weight={estimated_pdp_tail_bin_weight} "
+        f"estimated_pdp_tail_labels={','.join(estimated_pdp_tail_labels)} "
+        f"estimated_pdp_tail_gate_mode={estimated_pdp_tail_gate_mode} "
+        f"first_path_delay_tail_underestimate_weight={first_path_delay_tail_underestimate_weight} "
+        f"first_path_delay_bin_label_order={','.join(FIRST_PATH_DELAY_BIN_LABELS)} "
+        f"los_delay_weight={los_delay_weight} "
+        f"los_delay_nonnegative_weight={los_delay_nonnegative_weight} "
+        f"use_physics_calibration_loss={use_physics_calibration_loss} "
+        f"los_delay_consistency_weight={los_delay_consistency_weight} "
+        f"los_angle_weight={los_angle_weight} "
+        f"first_path_angle_weight={first_path_angle_weight} "
+        f"first_path_angle_nlos_weight={first_path_angle_nlos_weight} "
+        f"delay_spread_teacher_weight={delay_spread_teacher_weight} "
+        f"delay_spread_bin_classifier_weight={delay_spread_bin_classifier_weight} "
+        f"delay_spread_bin_position_weight={delay_spread_bin_position_weight} "
+        f"delay_spread_tail_classifier_weight={delay_spread_tail_classifier_weight} "
+        f"reflection_count_classifier_weight={reflection_count_classifier_weight} "
+        f"reflection_count_regression_weight={reflection_count_regression_weight} "
+        f"reflection_path_count_regression_weight={reflection_path_count_regression_weight} "
+        f"reflection_count_nlos_weight={reflection_count_nlos_weight} "
+        f"interaction_count_soft_labels={interaction_count_soft_labels} "
+        f"physics_relational_weight={physics_relational_weight} "
+        f"interaction_count_fields={format_interaction_count_fields(interaction_count_fields)} "
+        f"interaction_count_classifier_weight={interaction_count_classifier_weight} "
+        f"interaction_count_regression_weight={interaction_count_regression_weight} "
+        f"reflection_count_bin_label_order={','.join(REFLECTION_COUNT_BIN_LABELS)} "
+        f"delay_spread_bin_weights={format_delay_spread_bin_weights(delay_spread_bin_weights)} "
+        f"delay_spread_bin_label_order={','.join(DELAY_SPREAD_BIN_LABELS)} "
+        f"delay_spread_tail_label_order={','.join(DELAY_SPREAD_TAIL_LABELS)} "
+        f"first_path_power_bin_weights={format_first_path_power_bin_weights(first_path_power_bin_weights)} "
+        f"first_path_power_nlos_weight={first_path_power_nlos_weight} "
         f"multipositive_distance_threshold={multipositive_distance_threshold} "
         f"multipositive_positive_mode={multipositive_positive_mode} "
         f"min_class_size_for_multipositive={min_class_size_for_multipositive} "
+        f"noise_augmentation_enabled={noise_augmentation_enabled} "
+        f"noise_augmentation_probability={noise_augmentation_probability} "
+        f"noise_snr_db=[{noise_snr_min_db},{noise_snr_max_db}] "
+        f"noise_augmented_main_weight={noise_augmented_main_weight} "
+        f"noise_delay_consistency_weight={noise_delay_consistency_weight} "
+        f"noise_delay_spread_supervised_weight={noise_delay_spread_supervised_weight} "
+        f"noise_delay_spread_consistency_weight={noise_delay_spread_consistency_weight} "
+        f"noise_k_consistency_weight={noise_k_consistency_weight} "
+        f"noise_clean_k_supervised_weight={noise_clean_k_supervised_weight} "
+        f"noise_noisy_k_supervised_weight={noise_noisy_k_supervised_weight} "
         f"min_class_size={min_class_size} semantic_key_mode={semantic_key_mode} "
         f"filter_attribute_values={format_attribute_value_filters(effective_filter_attribute_values)} "
         f"limit_samples={limit_samples} "
         f"limit_samples_by_attribute={limit_samples_by_attribute} "
         f"limit_samples_per_attribute_value={limit_samples_per_attribute_value} "
-        f"freeze_csi={freeze_csi} freeze_text_prototypes={freeze_text_prototypes} "
+        f"max_delay_spread_ns={max_delay_spread_ns} "
+        f"freeze_csi={freeze_csi} semantic_anchor_mode={semantic_anchor_mode} "
+        f"freeze_text_encoder={freeze_text_encoder} "
+        f"freeze_prototypes={freeze_prototypes} "
         f"trainable_parameters={count_trainable_parameters(model)}"
     )
-
+    print(f"semantic_anchor_mode={semantic_anchor_mode}")
+    print(f"freeze_text_encoder={freeze_text_encoder}")
+    print(f"freeze_prototypes={freeze_prototypes}")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     log_path = output_path / "train_log.jsonl"
+    runtime_metadata = build_runtime_metadata(model=model, device=device, seed=seed)
+    training_start_time = datetime.now().astimezone().isoformat(timespec="seconds")
+    training_start_perf = time.perf_counter()
+    print_runtime_metadata(runtime_metadata)
+    print(f"training_start_time={training_start_time}")
 
     for epoch in range(1, epochs + 1):
         epoch_metrics = []
@@ -984,9 +2060,429 @@ def run_real_pretrain(
             m.get("batch_label_unique_classes", 0.0) for m in epoch_metrics
         ) / len(epoch_metrics)
         mean_aux_regression = sum(m.get("loss_aux_regression", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        total_power_mae_values = [
+            m["total_received_power_mae_db"]
+            for m in epoch_metrics
+            if "total_received_power_mae_db" in m
+        ]
+        mean_total_received_power_mae_db = (
+            sum(total_power_mae_values) / len(total_power_mae_values)
+            if total_power_mae_values
+            else 0.0
+        )
+        mean_strong_k_bin_classifier = sum(
+            m.get("loss_strong_k_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_bin_accuracy = sum(
+            m.get("accuracy_strong_k_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_position = sum(
+            m.get("loss_strong_k_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_position_mae = sum(
+            m.get("strong_k_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_strong_k_bin_loss_denominator = sum(
+            m.get("strong_k_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        last_strong_k_bin_class_weights = epoch_metrics[-1].get("strong_k_bin_class_weights", "")
+        strong_k_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "strong_k_bin_target_histogram",
+            len(K_FACTOR_STRONG_BIN_LABELS),
+        )
+        strong_k_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "strong_k_bin_prediction_histogram",
+            len(K_FACTOR_STRONG_BIN_LABELS),
+        )
+        strong_k_bin_target_distribution = format_histogram_counts(
+            K_FACTOR_STRONG_BIN_LABELS,
+            strong_k_bin_target_histogram,
+        )
+        strong_k_bin_prediction_distribution = format_histogram_counts(
+            K_FACTOR_STRONG_BIN_LABELS,
+            strong_k_bin_prediction_histogram,
+        )
+        mean_first_path_power_bin_classifier = sum(
+            m.get("loss_first_path_power_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_accuracy = sum(
+            m.get("accuracy_first_path_power_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_position = sum(
+            m.get("loss_first_path_power_bin_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_position_mae = sum(
+            m.get("first_path_power_bin_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_bin_loss_denominator = sum(
+            m.get("first_path_power_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_classifier = sum(
+            m.get("loss_delay_spread_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_accuracy = sum(
+            m.get("accuracy_delay_spread_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_position = sum(
+            m.get("loss_delay_spread_bin_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_position_mae = sum(
+            m.get("delay_spread_bin_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_bin_loss_denominator = sum(
+            m.get("delay_spread_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread = sum(
+            m.get("loss_delay_spread", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_raw = sum(
+            m.get("loss_delay_spread_raw", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_raw_mae_ns = sum(
+            m.get("delay_spread_raw_mae_ns", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_normalized_mae_ns = sum(
+            m.get("delay_spread_normalized_mae_ns", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_classifier = sum(
+            m.get("loss_delay_spread_tail_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_accuracy = sum(
+            m.get("delay_spread_tail_accuracy", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_recall = sum(
+            m.get("delay_spread_tail_recall", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_delay_spread_tail_false_positive = sum(
+            m.get("delay_spread_tail_false_positive", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        last_delay_spread_tail_positive_fraction = epoch_metrics[-1].get(
+            "delay_spread_tail_positive_fraction",
+            "",
+        )
+        last_delay_spread_tail_prediction_fraction = epoch_metrics[-1].get(
+            "delay_spread_tail_prediction_fraction",
+            "",
+        )
+        last_delay_spread_bin_class_weights = epoch_metrics[-1].get("delay_spread_bin_class_weights", "")
+        delay_spread_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "delay_spread_bin_target_histogram",
+            len(DELAY_SPREAD_BIN_LABELS),
+        )
+        delay_spread_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "delay_spread_bin_prediction_histogram",
+            len(DELAY_SPREAD_BIN_LABELS),
+        )
+        delay_spread_bin_target_distribution = format_histogram_counts(
+            DELAY_SPREAD_BIN_LABELS,
+            delay_spread_bin_target_histogram,
+        )
+        delay_spread_bin_prediction_distribution = format_histogram_counts(
+            DELAY_SPREAD_BIN_LABELS,
+            delay_spread_bin_prediction_histogram,
+        )
+        first_path_power_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "first_path_power_bin_target_histogram",
+            len(FIRST_POWER_DBW_BIN_LABELS),
+        )
+        first_path_power_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "first_path_power_bin_prediction_histogram",
+            len(FIRST_POWER_DBW_BIN_LABELS),
+        )
+        first_path_power_bin_target_distribution = format_histogram_counts(
+            FIRST_POWER_DBW_BIN_LABELS,
+            first_path_power_bin_target_histogram,
+        )
+        first_path_power_bin_prediction_distribution = format_histogram_counts(
+            FIRST_POWER_DBW_BIN_LABELS,
+            first_path_power_bin_prediction_histogram,
+        )
+        mean_first_path_delay_bin_classifier = sum(
+            m.get("loss_first_path_delay_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_bin_accuracy = sum(
+            m.get("accuracy_first_path_delay_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_bin_classifier = sum(
+            m.get("loss_estimated_pdp_tail_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_bin_accuracy = sum(
+            m.get("accuracy_estimated_pdp_tail_bin_classifier", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_gate_fraction = sum(
+            m.get("estimated_pdp_tail_gate_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_target_fraction = sum(
+            m.get("estimated_pdp_tail_target_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_estimated_pdp_tail_argmax_fraction = sum(
+            m.get("estimated_pdp_tail_argmax_fraction", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate = sum(
+            m.get("loss_first_path_delay_tail_underestimate", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate_mae_ns = sum(
+            m.get("first_path_delay_tail_underestimate_mae_ns", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate_mean_ns = sum(
+            m.get("first_path_delay_tail_underestimate_mean_ns", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_tail_underestimate_fraction = sum(
+            m.get("first_path_delay_tail_underestimate_fraction", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_bin_position = sum(
+            m.get("loss_first_path_delay_bin_position", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_bin_position_mae = sum(
+            m.get("first_path_delay_bin_position_mae", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_bin_consistency = sum(
+            m.get("loss_first_path_delay_bin_consistency", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_raw = sum(
+            m.get("loss_first_path_delay_raw", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_fused_raw = sum(
+            m.get("loss_first_path_delay_fused_raw", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_raw_mae_ns = sum(
+            m.get("first_path_delay_raw_mae_ns", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_fused_raw_mae_ns = sum(
+            m.get("first_path_delay_fused_raw_mae_ns", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_bin_consistency_violation_ns = sum(
+            m.get("first_path_delay_bin_consistency_violation_ns", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        max_first_path_delay_bin_consistency_violation_ns = max(
+            m.get("first_path_delay_bin_consistency_max_violation_ns", 0.0)
+            for m in epoch_metrics
+        )
+        mean_first_path_delay_bin_loss_denominator = sum(
+            m.get("first_path_delay_bin_loss_denominator", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        last_first_path_delay_bin_class_weights = epoch_metrics[-1].get(
+            "first_path_delay_bin_class_weights",
+            "",
+        )
+        first_path_delay_bin_target_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "first_path_delay_bin_target_histogram",
+            len(FIRST_PATH_DELAY_BIN_LABELS),
+        )
+        first_path_delay_bin_prediction_histogram = sum_histogram_metric(
+            epoch_metrics,
+            "first_path_delay_bin_prediction_histogram",
+            len(FIRST_PATH_DELAY_BIN_LABELS),
+        )
+        first_path_delay_bin_target_distribution = format_histogram_counts(
+            FIRST_PATH_DELAY_BIN_LABELS,
+            first_path_delay_bin_target_histogram,
+        )
+        first_path_delay_bin_prediction_distribution = format_histogram_counts(
+            FIRST_PATH_DELAY_BIN_LABELS,
+            first_path_delay_bin_prediction_histogram,
+        )
+        mean_direct_power = sum(m.get("loss_direct_power", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        nlos_power_enhanced_mae_values = [
+            m["nlos_first_path_power_enhanced_mae_db"]
+            for m in epoch_metrics
+            if "nlos_first_path_power_enhanced_mae_db" in m
+        ]
+        mean_nlos_first_path_power_enhanced_mae_db = (
+            sum(nlos_power_enhanced_mae_values) / len(nlos_power_enhanced_mae_values)
+            if nlos_power_enhanced_mae_values
+            else 0.0
+        )
+        nlos_power_base_mae_values = [
+            m["nlos_first_path_power_base_mae_db"]
+            for m in epoch_metrics
+            if "nlos_first_path_power_base_mae_db" in m
+        ]
+        mean_nlos_first_path_power_base_mae_db = (
+            sum(nlos_power_base_mae_values) / len(nlos_power_base_mae_values)
+            if nlos_power_base_mae_values
+            else 0.0
+        )
+        mean_first_path_power_delta_saturation = sum(
+            m.get("first_path_power_delta_saturation_fraction", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay = sum(m.get("loss_first_path_delay", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_los_delay = sum(m.get("loss_los_delay", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_los_delay_nonnegative = sum(
+            m.get("loss_los_delay_nonnegative", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_los_delay_consistency = sum(
+            m.get("loss_los_delay_consistency", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        los_delay_consistency_mae_values = [
+            m["los_delay_consistency_mae_ns"]
+            for m in epoch_metrics
+            if "los_delay_consistency_mae_ns" in m
+        ]
+        mean_los_delay_consistency_mae_ns = (
+            sum(los_delay_consistency_mae_values) / len(los_delay_consistency_mae_values)
+            if los_delay_consistency_mae_values
+            else 0.0
+        )
+        mean_physics_relational = sum(
+            m.get("loss_physics_relational", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_path_count = sum(
+            m.get("loss_physics_relational_path_count", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_delay_spread = sum(
+            m.get("loss_physics_relational_delay_spread", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_reflection_nonnegative = sum(
+            m.get("loss_physics_relational_reflection_nonnegative", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_los_delay_positive = sum(
+            m.get("loss_physics_relational_los_delay_positive", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_physics_relational_first_path_delay_eq_los_delay = sum(
+            m.get("loss_physics_relational_first_path_delay_eq_los_delay", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_reflection_path_count_loss = sum(
+            m.get("loss_reflection_path_count_regression", 0.0)
+            for m in epoch_metrics
+        ) / len(epoch_metrics)
+        reflection_path_count_mae_values = [
+            m["reflection_path_count_mae"]
+            for m in epoch_metrics
+            if "reflection_path_count_mae" in m
+        ]
+        mean_reflection_path_count_mae = (
+            sum(reflection_path_count_mae_values) / len(reflection_path_count_mae_values)
+            if reflection_path_count_mae_values
+            else 0.0
+        )
+        reflection_path_count_exact_values = [
+            m["reflection_path_count_exact_accuracy"]
+            for m in epoch_metrics
+            if "reflection_path_count_exact_accuracy" in m
+        ]
+        mean_reflection_path_count_exact_accuracy = (
+            sum(reflection_path_count_exact_values) / len(reflection_path_count_exact_values)
+            if reflection_path_count_exact_values
+            else 0.0
+        )
+        mean_los_angle = sum(m.get("loss_los_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_angle = sum(m.get("loss_first_path_angle", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        mean_first_path_angle_nlos = sum(
+            m.get("loss_first_path_angle_nlos", 0.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        los_angle_mae_values = [
+            m["los_angle_mae_deg"]
+            for m in epoch_metrics
+            if "los_angle_mae_deg" in m
+        ]
+        mean_los_angle_mae_deg = (
+            sum(los_angle_mae_values) / len(los_angle_mae_values)
+            if los_angle_mae_values
+            else 0.0
+        )
+        first_path_angle_mae_values = [
+            m["first_path_angle_mae_deg"]
+            for m in epoch_metrics
+            if "first_path_angle_mae_deg" in m
+        ]
+        mean_first_path_angle_mae_deg = (
+            sum(first_path_angle_mae_values) / len(first_path_angle_mae_values)
+            if first_path_angle_mae_values
+            else 0.0
+        )
+        first_path_angle_nlos_mae_values = [
+            m["first_path_angle_nlos_mae_deg"]
+            for m in epoch_metrics
+            if "first_path_angle_nlos_mae_deg" in m
+        ]
+        mean_first_path_angle_nlos_mae_deg = (
+            sum(first_path_angle_nlos_mae_values) / len(first_path_angle_nlos_mae_values)
+            if first_path_angle_nlos_mae_values
+            else 0.0
+        )
+        mean_k_factor_sample_weight = sum(
+            m.get("k_factor_sample_weight_mean", 1.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_power_sample_weight = sum(
+            m.get("first_path_power_sample_weight_mean", 1.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
+        mean_first_path_delay_sample_weight = sum(
+            m.get("first_path_delay_sample_weight_mean", 1.0) for m in epoch_metrics
+        ) / len(epoch_metrics)
         mean_positive_count = sum(m.get("multipositive_positive_count_mean", 0.0) for m in epoch_metrics) / len(epoch_metrics)
         mean_logit_scale = sum(m["logit_scale"] for m in epoch_metrics) / len(epoch_metrics)
         mean_prototype_warmup_active = sum(m.get("prototype_warmup_active", 0.0) for m in epoch_metrics) / len(epoch_metrics)
+        noise_epoch_metrics = [
+            m for m in epoch_metrics if m.get("noise_augmentation_applied", 0.0) > 0.0
+        ]
+        mean_noise_augmentation_applied = len(noise_epoch_metrics) / len(epoch_metrics)
+
+        def mean_noise_metric(name: str) -> float:
+            values = [m[name] for m in noise_epoch_metrics if name in m]
+            return sum(values) / len(values) if values else 0.0
+
+        clean_k_values = [
+            m["loss_noise_clean_k_supervised"]
+            for m in epoch_metrics
+            if "loss_noise_clean_k_supervised" in m
+        ]
+        mean_noise_clean_k_supervised = (
+            sum(clean_k_values) / len(clean_k_values) if clean_k_values else 0.0
+        )
+        clean_k_mae_values = [
+            m["noise_clean_k_mae_db"]
+            for m in epoch_metrics
+            if "noise_clean_k_mae_db" in m
+        ]
+        mean_noise_clean_k_mae_db = (
+            sum(clean_k_mae_values) / len(clean_k_mae_values)
+            if clean_k_mae_values
+            else 0.0
+        )
+        mean_noise_sampled_snr_db = mean_noise_metric("noise_sampled_snr_db")
+        mean_noise_actual_snr_db = mean_noise_metric("noise_actual_snr_db")
+        mean_noise_augmented_main = mean_noise_metric("loss_noise_augmented_main")
+        mean_noise_delay_supervised = mean_noise_metric("loss_noise_delay_supervised")
+        mean_noise_delay_spread_supervised = mean_noise_metric(
+            "loss_noise_delay_spread_supervised"
+        )
+        mean_noise_k_supervised = mean_noise_metric("loss_noise_k_supervised")
+        mean_noise_delay_consistency = mean_noise_metric("loss_noise_delay_consistency")
+        mean_noise_delay_spread_consistency = mean_noise_metric(
+            "loss_noise_delay_spread_consistency"
+        )
+        mean_noise_k_consistency = mean_noise_metric("loss_noise_k_consistency")
+        mean_noise_delay_mae_ns = mean_noise_metric("noise_delay_mae_ns")
+        mean_noise_delay_spread_mae_ns = mean_noise_metric(
+            "noise_delay_spread_mae_ns"
+        )
+        mean_noise_k_mae_db = mean_noise_metric("noise_k_mae_db")
+        mean_noise_delay_consistency_mae_ns = mean_noise_metric(
+            "noise_delay_consistency_mae_ns"
+        )
+        mean_noise_delay_spread_consistency_mae_ns = mean_noise_metric(
+            "noise_delay_spread_consistency_mae_ns"
+        )
+        mean_noise_k_consistency_mae_db = mean_noise_metric(
+            "noise_k_consistency_mae_db"
+        )
         last_batch_label_histogram = epoch_metrics[-1].get("batch_label_histogram", "")
         last_batch_semantic_argmax_histogram = epoch_metrics[-1].get("batch_semantic_argmax_histogram", "")
         last_batch_semantic_head_bias_values = epoch_metrics[-1].get("semantic_head_bias_values", "")
@@ -1011,16 +2507,43 @@ def run_real_pretrain(
             else ""
         )
         print(
-            f"epoch={epoch} steps={len(epoch_metrics)} "
-            f"loss={mean_total:.4f} contrastive={mean_contrastive:.4f} "
-            f"csi_to_text={mean_csi_to_text:.4f} csi_to_proto={mean_csi_to_prototype:.4f} "
-            f"text_to_proto={mean_text_to_prototype:.4f} "
-            f"sem_cls={mean_semantic_classifier:.4f} sem_acc={mean_semantic_accuracy:.4f} "
-            f"attr_cls={mean_attribute_classifier:.4f} attr_acc={mean_attribute_accuracy:.4f} "
-            f"proto_warmup_active={mean_prototype_warmup_active:.2f} "
-            f"{attribute_debug} "
-            f"aux_reg={mean_aux_regression:.4f} "
-            f"mp_pos={mean_positive_count:.1f} logit_scale={mean_logit_scale:.4f}"
+            f"epoch={epoch:03d}/{epochs} steps={len(epoch_metrics)} "
+            f"loss={mean_total:.4f} c2t={mean_csi_to_text:.4f} "
+            f"sem_acc={mean_semantic_accuracy:.4f} attr_acc={mean_attribute_accuracy:.4f} "
+            f"k_acc={mean_strong_k_bin_accuracy:.4f} k_pos_mae={mean_strong_k_position_mae:.4f} "
+            f"delay_acc={mean_delay_spread_bin_accuracy:.4f} "
+            f"delay_pos_mae={mean_delay_spread_bin_position_mae:.4f} "
+            f"delay_norm_loss={mean_delay_spread:.4f} "
+            f"delay_norm_mae={mean_delay_spread_normalized_mae_ns:.2f}ns "
+            f"delay_raw_mae={mean_delay_spread_raw_mae_ns:.2f}ns "
+            f"delay_raw_loss={mean_delay_spread_raw:.4f} "
+            f"first_delay_acc={mean_first_path_delay_bin_accuracy:.4f} "
+            f"pdp_tail_acc={mean_estimated_pdp_tail_bin_accuracy:.4f} "
+            f"pdp_tail_gate={mean_estimated_pdp_tail_gate_fraction:.4f} "
+            f"tail_under={mean_first_path_delay_tail_underestimate_mean_ns:.2f}ns "
+            f"first_delay_pos_mae={mean_first_path_delay_bin_position_mae:.4f} "
+            f"first_delay_raw_mae={mean_first_path_delay_raw_mae_ns:.2f}ns "
+            f"first_delay_fused_mae={mean_first_path_delay_fused_raw_mae_ns:.2f}ns "
+            f"first_delay_bin_violate={mean_first_path_delay_bin_consistency_violation_ns:.2f}ns "
+            f"los_nonneg={mean_los_delay_nonnegative:.4f} "
+            f"los_cons={mean_los_delay_consistency:.4f} "
+            f"los_cons_mae={mean_los_delay_consistency_mae_ns:.2f}ns "
+            f"rel={mean_physics_relational:.4f} "
+            f"los_angle_mae={mean_los_angle_mae_deg:.2f}deg "
+            f"first_angle_mae={mean_first_path_angle_mae_deg:.2f}deg "
+            f"first_angle_nlos_mae={mean_first_path_angle_nlos_mae_deg:.2f}deg "
+            f"nlos_power_base_mae={mean_nlos_first_path_power_base_mae_db:.2f}dB "
+            f"nlos_power_enh_mae={mean_nlos_first_path_power_enhanced_mae_db:.2f}dB "
+            f"total_power_mae={mean_total_received_power_mae_db:.2f}dB "
+            f"power_delta_sat={mean_first_path_power_delta_saturation:.4f} "
+            f"noise_frac={mean_noise_augmentation_applied:.3f} "
+            f"noise_snr={mean_noise_actual_snr_db:.2f}dB "
+            f"clean_k_mae={mean_noise_clean_k_mae_db:.2f}dB "
+            f"noise_delay_mae={mean_noise_delay_mae_ns:.2f}ns "
+            f"noise_delay_spread_mae={mean_noise_delay_spread_mae_ns:.2f}ns "
+            f"noise_k_mae={mean_noise_k_mae_db:.2f}dB "
+            f"aux={mean_aux_regression:.4f} grad_csi={mean_grad_csi_encoder:.2e} "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
         )
         with log_path.open("a", encoding="utf-8") as f:
             f.write(
@@ -1029,6 +2552,24 @@ def run_real_pretrain(
                         "epoch": epoch,
                         "steps": len(epoch_metrics),
                         "loss_total": mean_total,
+                        "noise_augmentation_applied_fraction": mean_noise_augmentation_applied,
+                        "noise_sampled_snr_db": mean_noise_sampled_snr_db,
+                        "noise_actual_snr_db": mean_noise_actual_snr_db,
+                        "loss_noise_clean_k_supervised": mean_noise_clean_k_supervised,
+                        "noise_clean_k_mae_db": mean_noise_clean_k_mae_db,
+                        "loss_noise_augmented_main": mean_noise_augmented_main,
+                        "loss_noise_delay_supervised": mean_noise_delay_supervised,
+                        "loss_noise_delay_spread_supervised": mean_noise_delay_spread_supervised,
+                        "loss_noise_k_supervised": mean_noise_k_supervised,
+                        "loss_noise_delay_consistency": mean_noise_delay_consistency,
+                        "loss_noise_delay_spread_consistency": mean_noise_delay_spread_consistency,
+                        "loss_noise_k_consistency": mean_noise_k_consistency,
+                        "noise_delay_mae_ns": mean_noise_delay_mae_ns,
+                        "noise_delay_spread_mae_ns": mean_noise_delay_spread_mae_ns,
+                        "noise_k_mae_db": mean_noise_k_mae_db,
+                        "noise_delay_consistency_mae_ns": mean_noise_delay_consistency_mae_ns,
+                        "noise_delay_spread_consistency_mae_ns": mean_noise_delay_spread_consistency_mae_ns,
+                        "noise_k_consistency_mae_db": mean_noise_k_consistency_mae_db,
                         "contrastive_loss": mean_contrastive,
                         "checkpoint": checkpoint_path,
                         "csi_to_text_weight": csi_to_text_weight,
@@ -1059,10 +2600,113 @@ def run_real_pretrain(
                         "grad_norm_semantic_classifier": mean_grad_semantic_classifier,
                         "grad_norm_attribute_classifiers": mean_grad_attribute_classifiers,
                         "loss_aux_regression": mean_aux_regression,
+                        "loss_strong_k_bin_classifier": mean_strong_k_bin_classifier,
+                        "accuracy_strong_k_bin_classifier": mean_strong_k_bin_accuracy,
+                        "loss_strong_k_position": mean_strong_k_position,
+                        "strong_k_position_mae": mean_strong_k_position_mae,
+                        "strong_k_bin_loss_denominator": mean_strong_k_bin_loss_denominator,
+                        "strong_k_bin_class_weights": last_strong_k_bin_class_weights,
+                        "strong_k_bin_label_order": list(K_FACTOR_STRONG_BIN_LABELS),
+                        "strong_k_bin_target_histogram": strong_k_bin_target_histogram,
+                        "strong_k_bin_prediction_histogram": strong_k_bin_prediction_histogram,
+                        "loss_first_path_power_bin_classifier": mean_first_path_power_bin_classifier,
+                        "accuracy_first_path_power_bin_classifier": mean_first_path_power_bin_accuracy,
+                        "loss_first_path_power_bin_position": mean_first_path_power_bin_position,
+                        "first_path_power_bin_position_mae": mean_first_path_power_bin_position_mae,
+                        "first_path_power_bin_loss_denominator": mean_first_path_power_bin_loss_denominator,
+                        "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
+                        "first_path_power_bin_target_histogram": first_path_power_bin_target_histogram,
+                        "first_path_power_bin_prediction_histogram": first_path_power_bin_prediction_histogram,
+                        "loss_first_path_delay_bin_classifier": mean_first_path_delay_bin_classifier,
+                        "accuracy_first_path_delay_bin_classifier": mean_first_path_delay_bin_accuracy,
+                        "loss_estimated_pdp_tail_bin_classifier": mean_estimated_pdp_tail_bin_classifier,
+                        "accuracy_estimated_pdp_tail_bin_classifier": mean_estimated_pdp_tail_bin_accuracy,
+                        "estimated_pdp_tail_gate_fraction": mean_estimated_pdp_tail_gate_fraction,
+                        "estimated_pdp_tail_target_fraction": mean_estimated_pdp_tail_target_fraction,
+                        "estimated_pdp_tail_argmax_fraction": mean_estimated_pdp_tail_argmax_fraction,
+                        "loss_first_path_delay_tail_underestimate": mean_first_path_delay_tail_underestimate,
+                        "first_path_delay_tail_underestimate_mae_ns": mean_first_path_delay_tail_underestimate_mae_ns,
+                        "first_path_delay_tail_underestimate_mean_ns": mean_first_path_delay_tail_underestimate_mean_ns,
+                        "first_path_delay_tail_underestimate_fraction": mean_first_path_delay_tail_underestimate_fraction,
+                        "loss_first_path_delay_bin_position": mean_first_path_delay_bin_position,
+                        "first_path_delay_bin_position_mae": mean_first_path_delay_bin_position_mae,
+                        "loss_first_path_delay_raw": mean_first_path_delay_raw,
+                        "loss_first_path_delay_fused_raw": mean_first_path_delay_fused_raw,
+                        "first_path_delay_raw_mae_ns": mean_first_path_delay_raw_mae_ns,
+                        "first_path_delay_fused_raw_mae_ns": mean_first_path_delay_fused_raw_mae_ns,
+                        "loss_first_path_delay_bin_consistency": mean_first_path_delay_bin_consistency,
+                        "first_path_delay_bin_consistency_violation_ns": mean_first_path_delay_bin_consistency_violation_ns,
+                        "first_path_delay_bin_consistency_max_violation_ns": max_first_path_delay_bin_consistency_violation_ns,
+                        "first_path_delay_bin_loss_denominator": mean_first_path_delay_bin_loss_denominator,
+                        "first_path_delay_bin_class_weights": last_first_path_delay_bin_class_weights,
+                        "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
+                        "first_path_delay_bin_target_histogram": first_path_delay_bin_target_histogram,
+                        "first_path_delay_bin_prediction_histogram": first_path_delay_bin_prediction_histogram,
+                        "first_path_delay_bin_target_distribution": first_path_delay_bin_target_distribution,
+                        "first_path_delay_bin_prediction_distribution": first_path_delay_bin_prediction_distribution,
+                        "loss_delay_spread_bin_classifier": mean_delay_spread_bin_classifier,
+                        "accuracy_delay_spread_bin_classifier": mean_delay_spread_bin_accuracy,
+                        "loss_delay_spread_bin_position": mean_delay_spread_bin_position,
+                        "delay_spread_bin_position_mae": mean_delay_spread_bin_position_mae,
+                        "delay_spread_bin_loss_denominator": mean_delay_spread_bin_loss_denominator,
+                        "delay_spread_bin_class_weights": last_delay_spread_bin_class_weights,
+                        "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
+                        "delay_spread_bin_target_histogram": delay_spread_bin_target_histogram,
+                        "delay_spread_bin_prediction_histogram": delay_spread_bin_prediction_histogram,
+                        "loss_delay_spread": mean_delay_spread,
+                        "loss_delay_spread_raw": mean_delay_spread_raw,
+                        "delay_spread_raw_mae_ns": mean_delay_spread_raw_mae_ns,
+                        "delay_spread_normalized_mae_ns": mean_delay_spread_normalized_mae_ns,
+                        "loss_delay_spread_tail_classifier": mean_delay_spread_tail_classifier,
+                        "accuracy_delay_spread_tail_classifier": mean_delay_spread_tail_accuracy,
+                        "recall_delay_spread_tail_classifier": mean_delay_spread_tail_recall,
+                        "false_positive_delay_spread_tail_classifier": mean_delay_spread_tail_false_positive,
+                        "delay_spread_tail_label_order": list(DELAY_SPREAD_TAIL_LABELS),
+                        "delay_spread_tail_positive_fraction": last_delay_spread_tail_positive_fraction,
+                        "delay_spread_tail_prediction_fraction": last_delay_spread_tail_prediction_fraction,
+                        "loss_direct_power": mean_direct_power,
+                        "nlos_first_path_power_base_mae_db": mean_nlos_first_path_power_base_mae_db,
+                        "nlos_first_path_power_enhanced_mae_db": mean_nlos_first_path_power_enhanced_mae_db,
+                        "total_received_power_mae_db": mean_total_received_power_mae_db,
+                        "first_path_power_delta_saturation_fraction": mean_first_path_power_delta_saturation,
+                        "loss_first_path_delay": mean_first_path_delay,
+                        "loss_los_delay": mean_los_delay,
+                        "loss_los_delay_nonnegative": mean_los_delay_nonnegative,
+                        "loss_los_delay_consistency": mean_los_delay_consistency,
+                        "los_delay_consistency_mae_ns": mean_los_delay_consistency_mae_ns,
+                        "loss_physics_relational": mean_physics_relational,
+                        "loss_physics_relational_path_count": mean_physics_relational_path_count,
+                        "loss_physics_relational_delay_spread": mean_physics_relational_delay_spread,
+                        "loss_physics_relational_reflection_nonnegative": mean_physics_relational_reflection_nonnegative,
+                        "loss_physics_relational_los_delay_positive": mean_physics_relational_los_delay_positive,
+                        "loss_physics_relational_first_path_delay_eq_los_delay": mean_physics_relational_first_path_delay_eq_los_delay,
+                        "loss_reflection_path_count_regression": mean_reflection_path_count_loss,
+                        "reflection_path_count_mae": mean_reflection_path_count_mae,
+                        "reflection_path_count_exact_accuracy": mean_reflection_path_count_exact_accuracy,
+                        "loss_los_angle": mean_los_angle,
+                        "los_angle_mae_deg": mean_los_angle_mae_deg,
+                        "loss_first_path_angle": mean_first_path_angle,
+                        "first_path_angle_mae_deg": mean_first_path_angle_mae_deg,
+                        "loss_first_path_angle_nlos": mean_first_path_angle_nlos,
+                        "first_path_angle_nlos_mae_deg": mean_first_path_angle_nlos_mae_deg,
+                        "k_factor_sample_weight_mean": mean_k_factor_sample_weight,
+                        "first_path_power_sample_weight_mean": mean_first_path_power_sample_weight,
+                        "first_path_delay_sample_weight_mean": mean_first_path_delay_sample_weight,
                         "logit_scale": mean_logit_scale,
                         "text_mode": text_mode,
                         "prototype_warmup_epochs": prototype_warmup_epochs,
                         "prototype_warmup_active": mean_prototype_warmup_active,
+                        "noise_augmentation_enabled": noise_augmentation_enabled,
+                        "noise_augmentation_probability": noise_augmentation_probability,
+                        "noise_snr_min_db": noise_snr_min_db,
+                        "noise_snr_max_db": noise_snr_max_db,
+                        "noise_augmented_main_weight": noise_augmented_main_weight,
+                        "noise_delay_consistency_weight": noise_delay_consistency_weight,
+                        "noise_delay_spread_supervised_weight": noise_delay_spread_supervised_weight,
+                        "noise_delay_spread_consistency_weight": noise_delay_spread_consistency_weight,
+                        "noise_k_consistency_weight": noise_k_consistency_weight,
+                        "noise_clean_k_supervised_weight": noise_clean_k_supervised_weight,
+                        "noise_noisy_k_supervised_weight": noise_noisy_k_supervised_weight,
                         "semantic_classifier_weight": semantic_classifier_weight,
                         "semantic_classifier_class_weight": semantic_classifier_class_weight,
                         "semantic_classifier_logit_adjustment": semantic_classifier_logit_adjustment,
@@ -1077,8 +2721,79 @@ def run_real_pretrain(
                             }
                             for field, mapping in attribute_remap.items()
                         },
+                        "token_norm_mode": token_norm_mode,
+                        "use_power_branch": use_power_branch,
+                        "detach_delay_spread_features": detach_delay_spread_features,
+                        "detach_first_path_delay_features": detach_first_path_delay_features,
+                        "use_delay_specific_encoder": use_delay_specific_encoder,
+                        "use_array_invariant_delay_encoder": use_array_invariant_delay_encoder,
+                        "use_continuous_config_encoding": use_continuous_config_encoding,
+                        "array_token_dropout": array_token_dropout,
+                        "array_token_min_tokens": array_token_min_tokens,
+                        "use_los_angle_context_encoder": use_los_angle_context_encoder,
+                        "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
+                        "use_first_path_aod_context_encoder": use_first_path_aod_context_encoder,
+                        "use_shared_physics_token": use_shared_physics_token,
+                        "shared_physics_token_residual_scale": shared_physics_token_residual_scale,
                         "aux_regression_weight": aux_regression_weight,
+                        "first_path_aod_weight": first_path_aod_weight,
+                        "first_path_aod_nlos_weight": first_path_aod_nlos_weight,
                         "aux_regression_targets": list(aux_regression_targets),
+                        "k_factor_loss_weights": k_factor_loss_weights,
+                        "strong_k_bin_classifier_weight": strong_k_bin_classifier_weight,
+                        "strong_k_position_weight": strong_k_position_weight,
+                        "strong_k_bin_weights": strong_k_bin_weights,
+                        "strong_k_bin_label_order": list(K_FACTOR_STRONG_BIN_LABELS),
+                        "first_path_power_bin_classifier_weight": first_path_power_bin_classifier_weight,
+                        "first_path_power_bin_position_weight": first_path_power_bin_position_weight,
+                        "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
+                        "direct_power_weight": direct_power_weight,
+                        "first_path_power_gate_mode": first_path_power_gate_mode,
+                        "first_path_power_mode": first_path_power_mode,
+                        "first_path_power_use_internal_gate": first_path_power_use_internal_gate,
+                        "nlos_enhanced_power_loss": nlos_enhanced_power_loss,
+                        "first_path_power_delta_limit": first_path_power_delta_limit,
+                        "delay_spread_weight": delay_spread_weight,
+                        "delay_spread_raw_weight": delay_spread_raw_weight,
+                        "delay_spread_raw_beta_ns": delay_spread_raw_beta_ns,
+                        "first_path_delay_weight": first_path_delay_weight,
+                        "first_path_delay_raw_weight": first_path_delay_raw_weight,
+                        "first_path_delay_fused_raw_weight": first_path_delay_fused_raw_weight,
+                        "first_path_delay_raw_beta_ns": first_path_delay_raw_beta_ns,
+                        "first_path_delay_bin_classifier_weight": first_path_delay_bin_classifier_weight,
+                        "first_path_delay_bin_position_weight": first_path_delay_bin_position_weight,
+                        "first_path_delay_bin_consistency_weight": first_path_delay_bin_consistency_weight,
+                        "first_path_delay_bin_weights": first_path_delay_bin_weights,
+                        "estimated_pdp_tail_bin_weight": estimated_pdp_tail_bin_weight,
+                        "estimated_pdp_tail_labels": list(estimated_pdp_tail_labels),
+                        "estimated_pdp_tail_gate_mode": estimated_pdp_tail_gate_mode,
+                        "first_path_delay_tail_underestimate_weight": first_path_delay_tail_underestimate_weight,
+                        "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
+                        "los_delay_weight": los_delay_weight,
+                        "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
+                        "use_physics_calibration_loss": use_physics_calibration_loss,
+                        "los_delay_consistency_weight": los_delay_consistency_weight,
+                        "los_angle_weight": los_angle_weight,
+                        "first_path_angle_weight": first_path_angle_weight,
+                        "first_path_angle_nlos_weight": first_path_angle_nlos_weight,
+                        "delay_spread_teacher_weight": delay_spread_teacher_weight,
+                        "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
+                        "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
+                        "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
+                        "reflection_count_classifier_weight": reflection_count_classifier_weight,
+                        "reflection_count_regression_weight": reflection_count_regression_weight,
+                        "reflection_path_count_regression_weight": reflection_path_count_regression_weight,
+                        "reflection_count_nlos_weight": reflection_count_nlos_weight,
+                        "interaction_count_soft_labels": interaction_count_soft_labels,
+                        "interaction_count_fields": list(interaction_count_fields),
+                        "interaction_count_classifier_weight": interaction_count_classifier_weight,
+                        "interaction_count_regression_weight": interaction_count_regression_weight,
+                        "reflection_count_bin_label_order": list(REFLECTION_COUNT_BIN_LABELS),
+                        "delay_spread_bin_weights": delay_spread_bin_weights,
+                        "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
+                        "delay_spread_tail_label_order": list(DELAY_SPREAD_TAIL_LABELS),
+                        "first_path_power_bin_weights": first_path_power_bin_weights,
+                        "first_path_power_nlos_weight": first_path_power_nlos_weight,
                         "multipositive_distance_threshold": multipositive_distance_threshold,
                         "multipositive_positive_mode": multipositive_positive_mode,
                         "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -1091,8 +2806,12 @@ def run_real_pretrain(
                         "limit_samples": limit_samples,
                         "limit_samples_by_attribute": limit_samples_by_attribute,
                         "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
+                        "max_delay_spread_ns": max_delay_spread_ns,
                         "freeze_csi": freeze_csi,
-                        "freeze_text_prototypes": freeze_text_prototypes,
+                        "semantic_anchor_mode": semantic_anchor_mode,
+                        "freeze_text_encoder": freeze_text_encoder,
+                        "freeze_prototypes": freeze_prototypes,
+                        "freeze_text_prototypes": freeze_text_encoder and freeze_prototypes,
                         "multipositive_positive_count_mean": mean_positive_count,
                         "lr": scheduler.get_last_lr()[0],
                     }
@@ -1108,14 +2827,44 @@ def run_real_pretrain(
                 "tokenizer_word2id": tokenizer.word2id,
                 "prototype_keys": serialize_prototype_keys(prototype_bank["keys"]),
                 "prototype_captions": prototype_bank["captions"],
+                "prototype_initial_text_features": initial_text_features,
                 "args": {
                     "data_path": data_path,
+                    "additional_data_paths": list(additional_data_paths),
                     "checkpoint": checkpoint_path,
                     "epochs": epochs,
+                    "seed": seed,
                     "lr": lr,
                     "weight_decay": weight_decay,
                     "batch_size": batch_size,
+                    "torch_version": runtime_metadata["torch_version"],
+                    "cuda_version": runtime_metadata["cuda_version"],
+                    "cudnn_version": runtime_metadata["cudnn_version"],
+                    "cuda_available": runtime_metadata["cuda_available"],
+                    "gpu_name": runtime_metadata["gpu_name"],
+                    "gpu_count": runtime_metadata["gpu_count"],
+                    "cuda_device_capability": runtime_metadata["cuda_device_capability"],
+                    "device": runtime_metadata["device"],
+                    "amp_enabled": runtime_metadata["amp_enabled"],
+                    "model_parameters": runtime_metadata["model_parameters"],
+                    "model_trainable_parameters": runtime_metadata["model_trainable_parameters"],
+                    "training_elapsed_seconds": time.perf_counter() - training_start_perf,
+                    "training_elapsed_hms": format_duration(time.perf_counter() - training_start_perf),
                     "temperature": temperature,
+                    "token_norm_mode": token_norm_mode,
+                    "use_power_branch": use_power_branch,
+                    "detach_delay_spread_features": detach_delay_spread_features,
+                    "detach_first_path_delay_features": detach_first_path_delay_features,
+                    "use_delay_specific_encoder": use_delay_specific_encoder,
+                    "use_array_invariant_delay_encoder": use_array_invariant_delay_encoder,
+                    "use_continuous_config_encoding": use_continuous_config_encoding,
+                    "array_token_dropout": array_token_dropout,
+                    "array_token_min_tokens": array_token_min_tokens,
+                    "use_los_angle_context_encoder": use_los_angle_context_encoder,
+                    "use_first_path_angle_context_encoder": use_first_path_angle_context_encoder,
+                    "use_first_path_aod_context_encoder": use_first_path_aod_context_encoder,
+                    "use_shared_physics_token": use_shared_physics_token,
+                    "shared_physics_token_residual_scale": shared_physics_token_residual_scale,
                     "warmup_epochs": warmup_epochs,
                     "min_lr": min_lr,
                     "csi_to_text_weight": csi_to_text_weight,
@@ -1123,6 +2872,17 @@ def run_real_pretrain(
                     "text_prototype_weight": text_prototype_weight,
                     "text_mode": text_mode,
                     "prototype_warmup_epochs": prototype_warmup_epochs,
+                    "noise_augmentation_enabled": noise_augmentation_enabled,
+                    "noise_augmentation_probability": noise_augmentation_probability,
+                    "noise_snr_min_db": noise_snr_min_db,
+                    "noise_snr_max_db": noise_snr_max_db,
+                    "noise_augmented_main_weight": noise_augmented_main_weight,
+                    "noise_delay_consistency_weight": noise_delay_consistency_weight,
+                    "noise_delay_spread_supervised_weight": noise_delay_spread_supervised_weight,
+                    "noise_delay_spread_consistency_weight": noise_delay_spread_consistency_weight,
+                    "noise_k_consistency_weight": noise_k_consistency_weight,
+                    "noise_clean_k_supervised_weight": noise_clean_k_supervised_weight,
+                    "noise_noisy_k_supervised_weight": noise_noisy_k_supervised_weight,
                     "semantic_classifier_weight": semantic_classifier_weight,
                     "semantic_classifier_class_weight": semantic_classifier_class_weight,
                     "semantic_classifier_logit_adjustment": semantic_classifier_logit_adjustment,
@@ -1138,7 +2898,63 @@ def run_real_pretrain(
                         for field, mapping in attribute_remap.items()
                     },
                     "aux_regression_weight": aux_regression_weight,
+                    "first_path_aod_weight": first_path_aod_weight,
+                    "first_path_aod_nlos_weight": first_path_aod_nlos_weight,
                     "aux_regression_targets": list(aux_regression_targets),
+                    "k_factor_loss_weights": k_factor_loss_weights,
+                    "strong_k_bin_classifier_weight": strong_k_bin_classifier_weight,
+                    "strong_k_position_weight": strong_k_position_weight,
+                    "strong_k_bin_weights": strong_k_bin_weights,
+                    "strong_k_bin_label_order": list(K_FACTOR_STRONG_BIN_LABELS),
+                    "first_path_power_bin_classifier_weight": first_path_power_bin_classifier_weight,
+                    "first_path_power_bin_position_weight": first_path_power_bin_position_weight,
+                    "first_path_power_bin_label_order": list(FIRST_POWER_DBW_BIN_LABELS),
+                    "direct_power_weight": direct_power_weight,
+                    "first_path_power_gate_mode": first_path_power_gate_mode,
+                    "first_path_power_mode": first_path_power_mode,
+                    "first_path_power_use_internal_gate": first_path_power_use_internal_gate,
+                    "nlos_enhanced_power_loss": nlos_enhanced_power_loss,
+                    "first_path_power_delta_limit": first_path_power_delta_limit,
+                    "delay_spread_weight": delay_spread_weight,
+                    "delay_spread_raw_weight": delay_spread_raw_weight,
+                    "delay_spread_raw_beta_ns": delay_spread_raw_beta_ns,
+                    "first_path_delay_weight": first_path_delay_weight,
+                    "first_path_delay_raw_weight": first_path_delay_raw_weight,
+                    "first_path_delay_fused_raw_weight": first_path_delay_fused_raw_weight,
+                    "first_path_delay_raw_beta_ns": first_path_delay_raw_beta_ns,
+                    "first_path_delay_bin_classifier_weight": first_path_delay_bin_classifier_weight,
+                    "first_path_delay_bin_position_weight": first_path_delay_bin_position_weight,
+                    "first_path_delay_bin_consistency_weight": first_path_delay_bin_consistency_weight,
+                    "first_path_delay_bin_weights": first_path_delay_bin_weights,
+                    "estimated_pdp_tail_bin_weight": estimated_pdp_tail_bin_weight,
+                    "estimated_pdp_tail_labels": list(estimated_pdp_tail_labels),
+                    "estimated_pdp_tail_gate_mode": estimated_pdp_tail_gate_mode,
+                    "first_path_delay_tail_underestimate_weight": first_path_delay_tail_underestimate_weight,
+                    "first_path_delay_bin_label_order": list(FIRST_PATH_DELAY_BIN_LABELS),
+                    "los_delay_weight": los_delay_weight,
+                    "los_delay_nonnegative_weight": los_delay_nonnegative_weight,
+                    "use_physics_calibration_loss": use_physics_calibration_loss,
+                    "los_delay_consistency_weight": los_delay_consistency_weight,
+                    "los_angle_weight": los_angle_weight,
+                    "first_path_angle_weight": first_path_angle_weight,
+                    "first_path_angle_nlos_weight": first_path_angle_nlos_weight,
+                    "delay_spread_teacher_weight": delay_spread_teacher_weight,
+                    "delay_spread_bin_classifier_weight": delay_spread_bin_classifier_weight,
+                    "delay_spread_bin_position_weight": delay_spread_bin_position_weight,
+                    "delay_spread_tail_classifier_weight": delay_spread_tail_classifier_weight,
+                    "reflection_count_classifier_weight": reflection_count_classifier_weight,
+                    "reflection_count_regression_weight": reflection_count_regression_weight,
+                    "reflection_path_count_regression_weight": reflection_path_count_regression_weight,
+                    "reflection_count_nlos_weight": reflection_count_nlos_weight,
+                    "interaction_count_soft_labels": interaction_count_soft_labels,
+                    "interaction_count_fields": list(interaction_count_fields),
+                    "interaction_count_classifier_weight": interaction_count_classifier_weight,
+                    "interaction_count_regression_weight": interaction_count_regression_weight,
+                    "reflection_count_bin_label_order": list(REFLECTION_COUNT_BIN_LABELS),
+                    "delay_spread_bin_weights": delay_spread_bin_weights,
+                    "delay_spread_bin_label_order": list(DELAY_SPREAD_BIN_LABELS),
+                    "first_path_power_bin_weights": first_path_power_bin_weights,
+                    "first_path_power_nlos_weight": first_path_power_nlos_weight,
                     "multipositive_distance_threshold": multipositive_distance_threshold,
                     "multipositive_positive_mode": multipositive_positive_mode,
                     "min_class_size_for_multipositive": min_class_size_for_multipositive,
@@ -1151,8 +2967,13 @@ def run_real_pretrain(
                     "limit_samples": limit_samples,
                     "limit_samples_by_attribute": limit_samples_by_attribute,
                     "limit_samples_per_attribute_value": limit_samples_per_attribute_value,
+                    "max_delay_spread_ns": max_delay_spread_ns,
+                    "allow_prototype_mismatch_transfer": allow_prototype_mismatch_transfer,
                     "freeze_csi": freeze_csi,
-                    "freeze_text_prototypes": freeze_text_prototypes,
+                    "semantic_anchor_mode": semantic_anchor_mode,
+                    "freeze_text_encoder": freeze_text_encoder,
+                    "freeze_prototypes": freeze_prototypes,
+                    "freeze_text_prototypes": freeze_text_encoder and freeze_prototypes,
                     "phase": f"csi_clip_{text_mode}_text",
                 },
             }
@@ -1161,23 +2982,143 @@ def run_real_pretrain(
             torch.save(checkpoint, output_path / "checkpoint_last.pt")
             print(f"saved checkpoint to {ckpt_path}")
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    training_elapsed_seconds = time.perf_counter() - training_start_perf
+    training_end_time = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"training_end_time={training_end_time}")
+    print(f"training_elapsed_seconds={training_elapsed_seconds:.2f}")
+    print(f"training_elapsed_hms={format_duration(training_elapsed_seconds)}")
+    runtime_summary = {
+        **runtime_metadata,
+        "training_start_time": training_start_time,
+        "training_end_time": training_end_time,
+        "training_elapsed_seconds": training_elapsed_seconds,
+        "training_elapsed_hms": format_duration(training_elapsed_seconds),
+    }
+    (output_path / "runtime_metadata.json").write_text(
+        json.dumps(runtime_summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(f"saved_runtime_metadata={output_path / 'runtime_metadata.json'}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true", help="Run a synthetic end-to-end training step.")
-    parser.add_argument("--data-path", type=str, help="Path to preprocessed .pt samples.")
+    parser.add_argument("--data-path", type=str, help="Primary preprocessed .pt samples.")
+    parser.add_argument(
+        "--additional-data-path",
+        action="append",
+        default=None,
+        help=(
+            "Additional preprocessed training split. Repeat this option to "
+            "jointly train on multiple array or OFDM configurations."
+        ),
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
         help="Load compatible model/tokenizer weights from a previous checkpoint before training.",
     )
+    parser.add_argument(
+        "--allow-prototype-mismatch-transfer",
+        action="store_true",
+        help=(
+            "Allow transfer from a checkpoint with different learnable prototypes. "
+            "Compatible weights are loaded, while prototypes and incompatible heads are reinitialized."
+        ),
+    )
     parser.add_argument("--config", type=str, default=str(ROOT / "configs" / "train.yaml"))
+    parser.add_argument("--seed", type=int, help="Random seed for reproducible training runs.")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-steps-per-epoch", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--temperature", type=float)
+    parser.add_argument("--token-norm-mode", choices=["std", "rms", "none"])
+    parser.add_argument("--enable-power-branch", action="store_true")
+    parser.add_argument(
+        "--disable-power-branch",
+        action="store_true",
+        help=(
+            "Force the power-specific context branch off, even when it is enabled "
+            "by the config or power/reflection auxiliary losses."
+        ),
+    )
+    parser.add_argument(
+        "--detach-delay-spread-features",
+        action="store_true",
+        help="Detach CSI features before delay-spread heads so delay losses do not update the shared CSI encoder.",
+    )
+    parser.add_argument(
+        "--detach-first-path-delay-features",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Detach first-path-delay head input from the delay-specific encoder. "
+            "Use --no-detach-first-path-delay-features for first-delay-only upper-bound experiments."
+        ),
+    )
+    parser.add_argument(
+        "--use-delay-specific-encoder",
+        action=argparse.BooleanOptionalAction,
+        help="Use a separate convolutional/attention encoder for delay-spread heads.",
+    )
+    parser.add_argument(
+        "--use-array-invariant-delay-encoder",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Aggregate frequency power, PDP, and phase-difference features "
+            "across spatial tokens before delay prediction."
+        ),
+    )
+    parser.add_argument(
+        "--use-continuous-config-encoding",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Replace the discrete bandwidth embedding with continuous array, "
+            "bandwidth, nf, antenna-spacing, and SCS features."
+        ),
+    )
+    parser.add_argument(
+        "--array-token-dropout",
+        type=float,
+        help="Training-only fraction of spatial tokens to drop per sample.",
+    )
+    parser.add_argument(
+        "--array-token-min-tokens",
+        type=int,
+        help="Minimum number of spatial tokens retained by array dropout.",
+    )
+    parser.add_argument(
+        "--use-los-angle-context-encoder",
+        action=argparse.BooleanOptionalAction,
+        help="Use a beam-aware CSI encoder branch dedicated to the LoS angle head.",
+    )
+    parser.add_argument(
+        "--use-first-path-angle-context-encoder",
+        action=argparse.BooleanOptionalAction,
+        help="Use a first-path selector context branch dedicated to first-path angle prediction.",
+    )
+    parser.add_argument(
+        "--use-first-path-aod-context-encoder",
+        action=argparse.BooleanOptionalAction,
+        help="Use a separate first-path selector context branch for AoD prediction.",
+    )
+    parser.add_argument(
+        "--use-shared-physics-token",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Route physics heads through a residual shared physical representation "
+            "z_phys before independent task heads."
+        ),
+    )
+    parser.add_argument(
+        "--shared-physics-token-residual-scale",
+        type=float,
+        help="Residual scale for the shared physics token MLP.",
+    )
     parser.add_argument("--warmup-epochs", type=int)
     parser.add_argument("--min-lr", type=float)
     parser.add_argument("--csi-to-text-weight", type=float)
@@ -1231,11 +3172,345 @@ def main() -> None:
         ),
     )
     parser.add_argument("--aux-regression-weight", type=float)
+    parser.add_argument("--first-path-aod-weight", type=float)
+    parser.add_argument("--first-path-aod-nlos-weight", type=float)
+    parser.add_argument(
+        "--k-factor-loss-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for K-factor aux regression as LABEL=WEIGHT. "
+            "Labels: weak, strong_low, strong_mid, strong_high, strong_very_high."
+        ),
+    )
+    parser.add_argument(
+        "--strong-k-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for strong K-factor low/mid/high/very_high prediction.",
+    )
+    parser.add_argument(
+        "--strong-k-position-weight",
+        type=float,
+        help="Auxiliary regression weight for strong K-factor position within its predicted dB bin.",
+    )
+    parser.add_argument(
+        "--strong-k-bin-weight",
+        action="append",
+        help=(
+            "Per-class weighting for strong K-factor bin classification as LABEL=WEIGHT. "
+            "Labels: low, mid, high, very_high."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-power-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for first-path-power bin prediction.",
+    )
+    parser.add_argument(
+        "--first-path-power-bin-position-weight",
+        type=float,
+        help="Auxiliary regression weight for first-path-power position within its dBW bin.",
+    )
     parser.add_argument(
         "--aux-regression-targets",
         nargs="+",
         choices=physics_aux_target_choices(),
         help="Physics targets used by aux regression. Defaults to train config, or all.",
+    )
+    parser.add_argument(
+        "--direct-power-weight",
+        type=float,
+        help="Small explicit supervision weight for the direct first-path-power head.",
+    )
+    parser.add_argument(
+        "--first-path-power-nlos-weight",
+        type=float,
+        help="Sample-weight multiplier for NLoS first-path-power supervision.",
+    )
+    parser.add_argument(
+        "--first-path-power-gate-mode",
+        choices=("none", "base"),
+        help=(
+            "How to route the final first-path-power prediction. base uses the base "
+            "physics head; none uses the model default."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-power-mode",
+        choices=("residual", "absolute"),
+        help=(
+            "Prediction mode for the enhanced first-path-power branch. "
+            "absolute predicts normalized power directly; residual predicts a correction from base."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-power-use-internal-gate",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Use the enhanced branch's internal sigmoid gate for first-path-power "
+            "residual correction. The outer predicted-LoS gate is still controlled "
+            "by --first-path-power-gate-mode."
+        ),
+    )
+    parser.add_argument(
+        "--nlos-enhanced-power-loss",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "When direct power supervision is enabled, train enhanced first-path "
+            "power only on NLoS samples."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-power-delta-limit",
+        type=float,
+        help="Clamp limit for the enhanced first-path-power delta in normalized units.",
+    )
+    parser.add_argument(
+        "--delay-spread-weight",
+        type=float,
+        help="Explicit supervision weight for the independent delay-spread head.",
+    )
+    parser.add_argument(
+        "--delay-spread-raw-weight",
+        type=float,
+        help="Supervision weight for delay-spread context prediction using raw ns Huber loss.",
+    )
+    parser.add_argument(
+        "--delay-spread-raw-beta-ns",
+        type=float,
+        help="Huber transition beta in ns for --delay-spread-raw-weight.",
+    )
+    parser.add_argument(
+        "--first-path-delay-weight",
+        type=float,
+        help="Supervision weight for first-path delay prediction from the shared delay context.",
+    )
+    parser.add_argument(
+        "--first-path-delay-raw-weight",
+        type=float,
+        help="Supervision weight for first-path delay prediction using raw ns Huber loss.",
+    )
+    parser.add_argument(
+        "--first-path-delay-fused-raw-weight",
+        type=float,
+        help=(
+            "Supervision weight for bin+position fused first-path delay using raw ns Huber loss."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-delay-raw-beta-ns",
+        type=float,
+        help="Huber transition beta in ns for --first-path-delay-raw-weight.",
+    )
+    parser.add_argument(
+        "--first-path-delay-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for first-path-delay bin prediction.",
+    )
+    parser.add_argument(
+        "--first-path-delay-bin-position-weight",
+        type=float,
+        help="Auxiliary regression weight for first-path-delay position within its ns bin.",
+    )
+    parser.add_argument(
+        "--first-path-delay-bin-consistency-weight",
+        type=float,
+        help=(
+            "Penalty weight for continuous first-path-delay predictions that fall outside "
+            "the target first-delay bin."
+        ),
+    )
+    parser.add_argument(
+        "--los-delay-weight",
+        type=float,
+        help="Supervision weight for LoS delay prediction from the shared delay context on LoS samples.",
+    )
+    parser.add_argument(
+        "--los-delay-nonnegative-weight",
+        type=float,
+        help="Penalty weight for negative LoS delay predictions on LoS samples.",
+    )
+    parser.add_argument(
+        "--use-physics-calibration-loss",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Enable the Physics Calibration Loss Pack. The initial pack adds "
+            "LoS first-path-delay/LoS-delay consistency."
+        ),
+    )
+    parser.add_argument(
+        "--los-delay-consistency-weight",
+        type=float,
+        help=(
+            "Physics calibration weight for LoS consistency between "
+            "first_path_delay and los_delay."
+        ),
+    )
+    parser.add_argument(
+        "--physics-relational-weight",
+        type=float,
+        help=(
+            "Soft regularization weight for relational physical constraints "
+            "such as path_count>=1, delay_spread>=0, reflection_count>=0, "
+            "and first_path_delay>=los_delay on LoS samples."
+        ),
+    )
+    parser.add_argument(
+        "--los-angle-weight",
+        type=float,
+        help="Supervision weight for LoS azimuth angle sin/cos prediction on LoS samples.",
+    )
+    parser.add_argument(
+        "--first-path-angle-weight",
+        type=float,
+        help="Supervision weight for first-path azimuth angle sin/cos prediction.",
+    )
+    parser.add_argument(
+        "--first-path-angle-nlos-weight",
+        type=float,
+        help="Extra supervision weight for first-path azimuth angle on NLoS samples.",
+    )
+    parser.add_argument(
+        "--delay-spread-teacher-weight",
+        type=float,
+        help="Distillation weight from the profile-direct delay-spread teacher to the CSI-only delay head.",
+    )
+    parser.add_argument(
+        "--delay-spread-bin-classifier-weight",
+        type=float,
+        help="Auxiliary classification weight for CSI-only delay-spread bin prediction.",
+    )
+    parser.add_argument(
+        "--delay-spread-bin-position-weight",
+        type=float,
+        help="Auxiliary regression weight for CSI-only delay-spread position within its ns bin.",
+    )
+    parser.add_argument(
+        "--delay-spread-tail-classifier-weight",
+        type=float,
+        help="Auxiliary binary classification weight for CSI-only delay-spread >=100ns/>=200ns prediction.",
+    )
+    parser.add_argument(
+        "--reflection-count-classifier-weight",
+        type=float,
+        help=(
+            "Auxiliary classification weight for total reflection-count bins "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--reflection-count-regression-weight",
+        type=float,
+        help=(
+            "Auxiliary regression weight for total reflection count "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--reflection-path-count-regression-weight",
+        type=float,
+        help=(
+            "Auxiliary regression weight for number of valid paths that contain "
+            "at least one reflection interaction."
+        ),
+    )
+    parser.add_argument(
+        "--reflection-count-nlos-weight",
+        type=float,
+        help="Sample weight multiplier for NLoS reflection-count supervision.",
+    )
+    parser.add_argument(
+        "--interaction-count-soft-labels",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Use ordinal soft labels for interaction/reflection count classification."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-count-fields",
+        nargs="+",
+        choices=("reflection_count",),
+        help=(
+            "Interaction-count targets included in the current calibration pack. "
+            "Currently only reflection_count is implemented."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-count-classifier-weight",
+        type=float,
+        help=(
+            "Auxiliary classification weight for total reflection-count bins "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--interaction-count-regression-weight",
+        type=float,
+        help=(
+            "Auxiliary regression weight for total reflection count "
+            "from global CSI, delay context, and power stats."
+        ),
+    )
+    parser.add_argument(
+        "--delay-spread-bin-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for delay-spread losses as LABEL=WEIGHT. "
+            "Labels: 0_25, 25_50, 50_100, 100_200, 200_400, 400_plus."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-power-bin-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for first-path-power losses as LABEL=WEIGHT. "
+            "Labels: very_weak, weak, moderate, strong."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-delay-bin-weight",
+        action="append",
+        help=(
+            "Per-bin weighting for first-path-delay bin losses as LABEL=WEIGHT. "
+            "Labels: 0_25, 25_50, 50_100, 100_200, 200_400, "
+            "400_600, 600_800, 800_1040, 1040_1280, 1280_plus."
+        ),
+    )
+    parser.add_argument(
+        "--estimated-pdp-tail-bin-weight",
+        type=float,
+        help=(
+            "Small auxiliary CE weight on first-path-delay bin logits, enabled "
+            "only for configured tail samples/PDP-tail-gated samples."
+        ),
+    )
+    parser.add_argument(
+        "--estimated-pdp-tail-label",
+        action="append",
+        help=(
+            "First-path-delay bin label treated as long-delay tail for the "
+            "estimated-PDP auxiliary loss. Can be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--estimated-pdp-tail-gate-mode",
+        choices=(
+            "target",
+            "pdp_argmax",
+            "target_or_pdp_argmax",
+            "target_and_pdp_argmax",
+        ),
+        help=(
+            "Sample gate for estimated-PDP tail auxiliary loss. target uses "
+            "true tail labels; pdp_argmax uses the estimated-PDP peak-delay bin."
+        ),
+    )
+    parser.add_argument(
+        "--first-path-delay-tail-underestimate-weight",
+        type=float,
+        help=(
+            "One-sided raw-ns loss weight for configured first-path-delay tail "
+            "bins. Only underestimates are penalized."
+        ),
     )
     parser.add_argument("--multipositive-distance-threshold", type=float)
     parser.add_argument(
@@ -1271,6 +3546,11 @@ def main() -> None:
         help="Number of samples to keep per value when --limit-samples-by-attribute is set.",
     )
     parser.add_argument(
+        "--max-delay-spread-ns",
+        type=float,
+        help="Drop samples whose delay_spread_ns is greater than or equal to this value.",
+    )
+    parser.add_argument(
         "--freeze-csi",
         action="store_true",
         help="Freeze the CSI encoder. Useful for attribute-head-only overfit diagnostics.",
@@ -1278,14 +3558,90 @@ def main() -> None:
     parser.add_argument(
         "--freeze-text-prototypes",
         action="store_true",
-        help="Freeze the text encoder and learnable prototypes.",
+        help=(
+            "Deprecated compatibility flag that freezes both the text encoder "
+            "and learnable prototypes. Prefer --semantic-anchor-mode."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-anchor-mode",
+        choices=SEMANTIC_ANCHOR_MODES,
+        help=(
+            "Ablation policy: fixed freezes text/prototypes; adaptive_prototypes "
+            "freezes text only; joint trains both. This overrides the legacy "
+            "freeze_text_prototypes config value."
+        ),
     )
     parser.add_argument("--min-class-size-for-multipositive", type=int)
+    parser.add_argument(
+        "--noise-augmentation",
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Enable the additional noisy CSI training branch. The default is "
+            "disabled; use --noise-augmentation to enable it and "
+            "--no-noise-augmentation to force clean-only training."
+        ),
+    )
+    parser.add_argument(
+        "--noise-augmentation-probability",
+        type=float,
+        help=(
+            "Probability that a training batch receives an additional noisy CSI "
+            "branch. Use 0.8 for 20%% clean-only and 80%% clean+noisy batches."
+        ),
+    )
+    parser.add_argument(
+        "--noise-snr-min-db",
+        type=float,
+        help="Minimum uniformly sampled training SNR in dB.",
+    )
+    parser.add_argument(
+        "--noise-snr-max-db",
+        type=float,
+        help="Maximum uniformly sampled training SNR in dB.",
+    )
+    parser.add_argument(
+        "--noise-augmented-main-weight",
+        type=float,
+        help="Weight for the masked multi-target physics loss on noisy CSI.",
+    )
+    parser.add_argument(
+        "--noise-delay-consistency-weight",
+        type=float,
+        help="Weight for clean/noisy first-delay prediction consistency.",
+    )
+    parser.add_argument(
+        "--noise-delay-spread-supervised-weight",
+        type=float,
+        help="Weight for supervised delay-spread loss on noisy CSI.",
+    )
+    parser.add_argument(
+        "--noise-delay-spread-consistency-weight",
+        type=float,
+        help="Weight for clean/noisy delay-spread prediction consistency.",
+    )
+    parser.add_argument(
+        "--noise-k-consistency-weight",
+        type=float,
+        help="Weight for clean/noisy K-factor prediction consistency.",
+    )
+    parser.add_argument(
+        "--noise-clean-k-supervised-weight",
+        type=float,
+        help="Extra weight for clean-CSI K-factor supervision when noise training is enabled.",
+    )
+    parser.add_argument(
+        "--noise-noisy-k-supervised-weight",
+        type=float,
+        help="Extra weight for noisy-CSI K-factor supervision.",
+    )
     parser.add_argument("--output-dir", type=str)
     parser.add_argument("--save-every", type=int)
     args = parser.parse_args()
 
     train_cfg = load_train_config(args.config)
+    seed = args.seed if args.seed is not None else int(cfg_get(train_cfg, "seed", 0))
+    set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     epochs = args.epochs if args.epochs is not None else int(cfg_get(train_cfg, "epochs", 3))
@@ -1301,6 +3657,93 @@ def main() -> None:
         if args.temperature is not None
         else float(cfg_get(train_cfg, "temperature", 0.07))
     )
+    token_norm_mode = (
+        args.token_norm_mode
+        if args.token_norm_mode is not None
+        else str(cfg_get(train_cfg, "token_norm_mode", "std"))
+    )
+    if args.enable_power_branch and args.disable_power_branch:
+        raise ValueError(
+            "--enable-power-branch and --disable-power-branch cannot be used together."
+        )
+    use_power_branch = bool(
+        not args.disable_power_branch
+        and (
+            args.enable_power_branch
+            or cfg_get(train_cfg, "use_power_branch", False)
+        )
+    )
+    detach_delay_spread_features = bool(
+        args.detach_delay_spread_features
+        or cfg_get(train_cfg, "detach_delay_spread_features", False)
+    )
+    detach_first_path_delay_features = bool(
+        args.detach_first_path_delay_features
+        if args.detach_first_path_delay_features is not None
+        else cfg_get(train_cfg, "detach_first_path_delay_features", True)
+    )
+    use_delay_specific_encoder = (
+        args.use_delay_specific_encoder
+        if args.use_delay_specific_encoder is not None
+        else bool(cfg_get(train_cfg, "use_delay_specific_encoder", False))
+    )
+    use_array_invariant_delay_encoder = (
+        args.use_array_invariant_delay_encoder
+        if args.use_array_invariant_delay_encoder is not None
+        else bool(
+            cfg_get(
+                train_cfg,
+                "use_array_invariant_delay_encoder",
+                False,
+            )
+        )
+    )
+    use_continuous_config_encoding = (
+        args.use_continuous_config_encoding
+        if args.use_continuous_config_encoding is not None
+        else bool(cfg_get(train_cfg, "use_continuous_config_encoding", False))
+    )
+    array_token_dropout = (
+        args.array_token_dropout
+        if args.array_token_dropout is not None
+        else float(cfg_get(train_cfg, "array_token_dropout", 0.0))
+    )
+    array_token_min_tokens = (
+        args.array_token_min_tokens
+        if args.array_token_min_tokens is not None
+        else int(cfg_get(train_cfg, "array_token_min_tokens", 4))
+    )
+    if not 0.0 <= array_token_dropout < 1.0:
+        raise ValueError("--array-token-dropout must be in [0, 1).")
+    if array_token_min_tokens <= 0:
+        raise ValueError("--array-token-min-tokens must be positive.")
+    use_los_angle_context_encoder = (
+        args.use_los_angle_context_encoder
+        if args.use_los_angle_context_encoder is not None
+        else bool(cfg_get(train_cfg, "use_los_angle_context_encoder", False))
+    )
+    use_first_path_angle_context_encoder = (
+        args.use_first_path_angle_context_encoder
+        if args.use_first_path_angle_context_encoder is not None
+        else bool(cfg_get(train_cfg, "use_first_path_angle_context_encoder", False))
+    )
+    use_first_path_aod_context_encoder = (
+        args.use_first_path_aod_context_encoder
+        if args.use_first_path_aod_context_encoder is not None
+        else bool(cfg_get(train_cfg, "use_first_path_aod_context_encoder", False))
+    )
+    use_shared_physics_token = (
+        args.use_shared_physics_token
+        if args.use_shared_physics_token is not None
+        else bool(cfg_get(train_cfg, "use_shared_physics_token", False))
+    )
+    shared_physics_token_residual_scale = (
+        args.shared_physics_token_residual_scale
+        if args.shared_physics_token_residual_scale is not None
+        else float(cfg_get(train_cfg, "shared_physics_token_residual_scale", 1.0))
+    )
+    if shared_physics_token_residual_scale < 0.0:
+        raise ValueError("--shared-physics-token-residual-scale must be non-negative.")
     warmup_epochs = (
         args.warmup_epochs
         if args.warmup_epochs is not None
@@ -1382,11 +3825,373 @@ def main() -> None:
         if args.aux_regression_weight is not None
         else float(cfg_get(train_cfg, "aux_regression_weight", 0.0))
     )
+    first_path_aod_weight = (
+        args.first_path_aod_weight
+        if args.first_path_aod_weight is not None
+        else float(cfg_get(train_cfg, "first_path_aod_weight", aux_regression_weight))
+    )
+    if first_path_aod_weight < 0.0:
+        raise ValueError("--first-path-aod-weight must be non-negative.")
+    first_path_aod_nlos_weight = (
+        args.first_path_aod_nlos_weight
+        if args.first_path_aod_nlos_weight is not None
+        else float(cfg_get(train_cfg, "first_path_aod_nlos_weight", 0.0))
+    )
+    if first_path_aod_nlos_weight < 0.0:
+        raise ValueError("--first-path-aod-nlos-weight must be non-negative.")
+    k_factor_loss_weights = parse_k_factor_loss_weights(
+        args.k_factor_loss_weight
+        if args.k_factor_loss_weight is not None
+        else cfg_get(train_cfg, "k_factor_loss_weights", None)
+    )
+    strong_k_bin_classifier_weight = (
+        args.strong_k_bin_classifier_weight
+        if args.strong_k_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "strong_k_bin_classifier_weight", 0.0))
+    )
+    strong_k_position_weight = (
+        args.strong_k_position_weight
+        if args.strong_k_position_weight is not None
+        else float(cfg_get(train_cfg, "strong_k_position_weight", 0.0))
+    )
+    strong_k_bin_weights = parse_strong_k_bin_weights(
+        args.strong_k_bin_weight
+        if args.strong_k_bin_weight is not None
+        else cfg_get(train_cfg, "strong_k_bin_weights", None)
+    )
+    first_path_power_bin_classifier_weight = (
+        args.first_path_power_bin_classifier_weight
+        if args.first_path_power_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "first_path_power_bin_classifier_weight", 0.0))
+    )
+    first_path_power_bin_position_weight = (
+        args.first_path_power_bin_position_weight
+        if args.first_path_power_bin_position_weight is not None
+        else float(cfg_get(train_cfg, "first_path_power_bin_position_weight", 0.0))
+    )
+    direct_power_weight = (
+        args.direct_power_weight
+        if args.direct_power_weight is not None
+        else float(cfg_get(train_cfg, "direct_power_weight", 0.0))
+    )
+    first_path_power_nlos_weight = (
+        args.first_path_power_nlos_weight
+        if args.first_path_power_nlos_weight is not None
+        else float(cfg_get(train_cfg, "first_path_power_nlos_weight", 1.0))
+    )
+    if first_path_power_nlos_weight <= 0.0:
+        raise ValueError("--first-path-power-nlos-weight must be positive.")
+    first_path_power_gate_mode = (
+        args.first_path_power_gate_mode
+        if args.first_path_power_gate_mode is not None
+        else str(cfg_get(train_cfg, "first_path_power_gate_mode", "none"))
+    )
+    if first_path_power_gate_mode not in {"none", "base"}:
+        raise ValueError(
+            "first_path_power_gate_mode must be one of: none, base."
+        )
+    first_path_power_mode = (
+        args.first_path_power_mode
+        if args.first_path_power_mode is not None
+        else str(cfg_get(train_cfg, "first_path_power_mode", "residual"))
+    )
+    if first_path_power_mode not in {"residual", "absolute"}:
+        raise ValueError(
+            "first_path_power_mode must be one of: residual, absolute."
+        )
+    first_path_power_use_internal_gate = (
+        args.first_path_power_use_internal_gate
+        if args.first_path_power_use_internal_gate is not None
+        else bool(cfg_get(train_cfg, "first_path_power_use_internal_gate", True))
+    )
+    nlos_enhanced_power_loss = (
+        args.nlos_enhanced_power_loss
+        if args.nlos_enhanced_power_loss is not None
+        else bool(cfg_get(train_cfg, "nlos_enhanced_power_loss", False))
+    )
+    first_path_power_delta_limit = (
+        args.first_path_power_delta_limit
+        if args.first_path_power_delta_limit is not None
+        else float(cfg_get(train_cfg, "first_path_power_delta_limit", 0.5))
+    )
+    if first_path_power_delta_limit <= 0.0:
+        raise ValueError("--first-path-power-delta-limit must be positive.")
+    delay_spread_weight = (
+        args.delay_spread_weight
+        if args.delay_spread_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_weight", 0.0))
+    )
+    delay_spread_raw_weight = (
+        args.delay_spread_raw_weight
+        if args.delay_spread_raw_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_raw_weight", 0.0))
+    )
+    delay_spread_raw_beta_ns = (
+        args.delay_spread_raw_beta_ns
+        if args.delay_spread_raw_beta_ns is not None
+        else float(cfg_get(train_cfg, "delay_spread_raw_beta_ns", 20.0))
+    )
+    if delay_spread_raw_beta_ns <= 0.0:
+        raise ValueError("--delay-spread-raw-beta-ns must be positive.")
+    first_path_delay_weight = (
+        args.first_path_delay_weight
+        if args.first_path_delay_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_weight", 0.0))
+    )
+    first_path_delay_raw_weight = (
+        args.first_path_delay_raw_weight
+        if args.first_path_delay_raw_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_raw_weight", 0.0))
+    )
+    first_path_delay_fused_raw_weight = (
+        args.first_path_delay_fused_raw_weight
+        if args.first_path_delay_fused_raw_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_fused_raw_weight", 0.0))
+    )
+    first_path_delay_raw_beta_ns = (
+        args.first_path_delay_raw_beta_ns
+        if args.first_path_delay_raw_beta_ns is not None
+        else float(cfg_get(train_cfg, "first_path_delay_raw_beta_ns", 20.0))
+    )
+    if first_path_delay_raw_beta_ns <= 0.0:
+        raise ValueError("--first-path-delay-raw-beta-ns must be positive.")
+    first_path_delay_bin_classifier_weight = (
+        args.first_path_delay_bin_classifier_weight
+        if args.first_path_delay_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_bin_classifier_weight", 0.0))
+    )
+    first_path_delay_bin_position_weight = (
+        args.first_path_delay_bin_position_weight
+        if args.first_path_delay_bin_position_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_bin_position_weight", 0.0))
+    )
+    first_path_delay_bin_consistency_weight = (
+        args.first_path_delay_bin_consistency_weight
+        if args.first_path_delay_bin_consistency_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_bin_consistency_weight", 0.0))
+    )
+    first_path_delay_bin_weights = parse_first_path_delay_bin_weights(
+        args.first_path_delay_bin_weight
+        if args.first_path_delay_bin_weight is not None
+        else cfg_get(train_cfg, "first_path_delay_bin_weights", None)
+    )
+    estimated_pdp_tail_bin_weight = (
+        args.estimated_pdp_tail_bin_weight
+        if args.estimated_pdp_tail_bin_weight is not None
+        else float(cfg_get(train_cfg, "estimated_pdp_tail_bin_weight", 0.0))
+    )
+    if estimated_pdp_tail_bin_weight < 0.0:
+        raise ValueError("--estimated-pdp-tail-bin-weight must be non-negative.")
+    estimated_pdp_tail_labels = parse_first_path_delay_tail_labels(
+        args.estimated_pdp_tail_label
+        if args.estimated_pdp_tail_label is not None
+        else cfg_get(train_cfg, "estimated_pdp_tail_labels", ("1040_1280",))
+    )
+    estimated_pdp_tail_gate_mode = (
+        args.estimated_pdp_tail_gate_mode
+        if args.estimated_pdp_tail_gate_mode is not None
+        else str(cfg_get(train_cfg, "estimated_pdp_tail_gate_mode", "target"))
+    )
+    if estimated_pdp_tail_gate_mode not in {
+        "target",
+        "pdp_argmax",
+        "target_or_pdp_argmax",
+        "target_and_pdp_argmax",
+    }:
+        raise ValueError(
+            "estimated_pdp_tail_gate_mode must be one of target, pdp_argmax, "
+            "target_or_pdp_argmax, target_and_pdp_argmax."
+        )
+    first_path_delay_tail_underestimate_weight = (
+        args.first_path_delay_tail_underestimate_weight
+        if args.first_path_delay_tail_underestimate_weight is not None
+        else float(cfg_get(train_cfg, "first_path_delay_tail_underestimate_weight", 0.0))
+    )
+    if first_path_delay_tail_underestimate_weight < 0.0:
+        raise ValueError(
+            "--first-path-delay-tail-underestimate-weight must be non-negative."
+        )
+    los_delay_weight = (
+        args.los_delay_weight
+        if args.los_delay_weight is not None
+        else float(cfg_get(train_cfg, "los_delay_weight", 0.0))
+    )
+    los_delay_nonnegative_weight = (
+        args.los_delay_nonnegative_weight
+        if args.los_delay_nonnegative_weight is not None
+        else float(cfg_get(train_cfg, "los_delay_nonnegative_weight", 0.0))
+    )
+    use_physics_calibration_loss = (
+        args.use_physics_calibration_loss
+        if args.use_physics_calibration_loss is not None
+        else bool(cfg_get(train_cfg, "use_physics_calibration_loss", False))
+    )
+    los_delay_consistency_weight = (
+        args.los_delay_consistency_weight
+        if args.los_delay_consistency_weight is not None
+        else float(cfg_get(train_cfg, "los_delay_consistency_weight", 0.0))
+    )
+    if los_delay_consistency_weight < 0.0:
+        raise ValueError("--los-delay-consistency-weight must be non-negative.")
+    physics_relational_weight = (
+        args.physics_relational_weight
+        if args.physics_relational_weight is not None
+        else float(cfg_get(train_cfg, "physics_relational_weight", 0.0))
+    )
+    if physics_relational_weight < 0.0:
+        raise ValueError("--physics-relational-weight must be non-negative.")
+    los_angle_weight = (
+        args.los_angle_weight
+        if args.los_angle_weight is not None
+        else float(cfg_get(train_cfg, "los_angle_weight", 0.0))
+    )
+    if los_angle_weight < 0.0:
+        raise ValueError("--los-angle-weight must be non-negative.")
+    first_path_angle_weight = (
+        args.first_path_angle_weight
+        if args.first_path_angle_weight is not None
+        else float(cfg_get(train_cfg, "first_path_angle_weight", 0.0))
+    )
+    if first_path_angle_weight < 0.0:
+        raise ValueError("--first-path-angle-weight must be non-negative.")
+    first_path_angle_nlos_weight = (
+        args.first_path_angle_nlos_weight
+        if args.first_path_angle_nlos_weight is not None
+        else float(cfg_get(train_cfg, "first_path_angle_nlos_weight", 0.0))
+    )
+    if first_path_angle_nlos_weight < 0.0:
+        raise ValueError("--first-path-angle-nlos-weight must be non-negative.")
+    delay_spread_teacher_weight = (
+        args.delay_spread_teacher_weight
+        if args.delay_spread_teacher_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_teacher_weight", 0.1))
+    )
+    delay_spread_bin_weights = parse_delay_spread_bin_weights(
+        args.delay_spread_bin_weight
+        if args.delay_spread_bin_weight is not None
+        else cfg_get(train_cfg, "delay_spread_bin_weights", None)
+    )
+    delay_spread_bin_classifier_weight = (
+        args.delay_spread_bin_classifier_weight
+        if args.delay_spread_bin_classifier_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_bin_classifier_weight", 0.0))
+    )
+    delay_spread_bin_position_weight = (
+        args.delay_spread_bin_position_weight
+        if args.delay_spread_bin_position_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_bin_position_weight", 0.0))
+    )
+    delay_spread_tail_classifier_weight = (
+        args.delay_spread_tail_classifier_weight
+        if args.delay_spread_tail_classifier_weight is not None
+        else float(cfg_get(train_cfg, "delay_spread_tail_classifier_weight", 0.0))
+    )
+    reflection_count_classifier_weight = (
+        args.reflection_count_classifier_weight
+        if args.reflection_count_classifier_weight is not None
+        else float(
+            cfg_get(
+                train_cfg,
+                "reflection_count_classifier_weight",
+                cfg_get(train_cfg, "interaction_count_classifier_weight", 0.0),
+            )
+        )
+    )
+    if reflection_count_classifier_weight < 0.0:
+        raise ValueError("--reflection-count-classifier-weight must be non-negative.")
+    reflection_count_regression_weight = (
+        args.reflection_count_regression_weight
+        if args.reflection_count_regression_weight is not None
+        else float(
+            cfg_get(
+                train_cfg,
+                "reflection_count_regression_weight",
+                cfg_get(train_cfg, "interaction_count_regression_weight", 0.0),
+            )
+        )
+    )
+    if reflection_count_regression_weight < 0.0:
+        raise ValueError("--reflection-count-regression-weight must be non-negative.")
+    reflection_path_count_regression_weight = (
+        args.reflection_path_count_regression_weight
+        if args.reflection_path_count_regression_weight is not None
+        else float(cfg_get(train_cfg, "reflection_path_count_regression_weight", 0.0))
+    )
+    if reflection_path_count_regression_weight < 0.0:
+        raise ValueError(
+            "--reflection-path-count-regression-weight must be non-negative."
+        )
+    reflection_count_nlos_weight = (
+        args.reflection_count_nlos_weight
+        if args.reflection_count_nlos_weight is not None
+        else float(cfg_get(train_cfg, "reflection_count_nlos_weight", 1.0))
+    )
+    if reflection_count_nlos_weight <= 0.0:
+        raise ValueError("--reflection-count-nlos-weight must be positive.")
+    interaction_count_soft_labels = (
+        args.interaction_count_soft_labels
+        if args.interaction_count_soft_labels is not None
+        else bool(cfg_get(train_cfg, "interaction_count_soft_labels", False))
+    )
+    interaction_count_fields = parse_interaction_count_fields(
+        args.interaction_count_fields
+        if args.interaction_count_fields is not None
+        else cfg_get(train_cfg, "interaction_count_fields", ("reflection_count",))
+    )
+    interaction_count_classifier_weight = (
+        args.interaction_count_classifier_weight
+        if args.interaction_count_classifier_weight is not None
+        else reflection_count_classifier_weight
+    )
+    if interaction_count_classifier_weight < 0.0:
+        raise ValueError("--interaction-count-classifier-weight must be non-negative.")
+    if (
+        args.reflection_count_classifier_weight is None
+        and args.interaction_count_classifier_weight is not None
+    ):
+        reflection_count_classifier_weight = interaction_count_classifier_weight
+    interaction_count_regression_weight = (
+        args.interaction_count_regression_weight
+        if args.interaction_count_regression_weight is not None
+        else reflection_count_regression_weight
+    )
+    if interaction_count_regression_weight < 0.0:
+        raise ValueError("--interaction-count-regression-weight must be non-negative.")
+    if (
+        args.reflection_count_regression_weight is None
+        and args.interaction_count_regression_weight is not None
+    ):
+        reflection_count_regression_weight = interaction_count_regression_weight
+    first_path_power_bin_weights = parse_first_path_power_bin_weights(
+        args.first_path_power_bin_weight
+        if args.first_path_power_bin_weight is not None
+        else cfg_get(train_cfg, "first_path_power_bin_weights", None)
+    )
+    if (
+        (
+            first_path_power_bin_classifier_weight > 0.0
+            or first_path_power_bin_position_weight > 0.0
+            or direct_power_weight > 0.0
+            or reflection_count_classifier_weight > 0.0
+            or reflection_count_regression_weight > 0.0
+            or reflection_path_count_regression_weight > 0.0
+        )
+        and not use_power_branch
+        and not args.disable_power_branch
+    ):
+        use_power_branch = True
     aux_regression_targets = parse_aux_regression_targets(
         args.aux_regression_targets
         if args.aux_regression_targets is not None
         else cfg_get(train_cfg, "aux_regression_targets", "all")
     )
+    if first_path_aod_weight > 0.0 or first_path_aod_nlos_weight > 0.0:
+        aod_names = {"first_path_aod_az_sin", "first_path_aod_az_cos"}
+        if "all" not in aux_regression_targets and not aod_names.issubset(aux_regression_targets):
+            raise ValueError(
+                "Positive AoD loss weight requires first_path_aod_az_deg "
+                "(or both AoD sin/cos targets) in --aux-regression-targets."
+            )
     multipositive_distance_threshold = (
         args.multipositive_distance_threshold
         if args.multipositive_distance_threshold is not None
@@ -1402,6 +4207,84 @@ def main() -> None:
         if args.min_class_size_for_multipositive is not None
         else int(cfg_get(train_cfg, "min_class_size_for_multipositive", 2))
     )
+    noise_augmentation_enabled = (
+        args.noise_augmentation
+        if args.noise_augmentation is not None
+        else bool(cfg_get(train_cfg, "noise_augmentation_enabled", False))
+    )
+    noise_augmentation_probability = (
+        args.noise_augmentation_probability
+        if args.noise_augmentation_probability is not None
+        else float(cfg_get(train_cfg, "noise_augmentation_probability", 0.0))
+    )
+    noise_snr_min_db = (
+        args.noise_snr_min_db
+        if args.noise_snr_min_db is not None
+        else float(cfg_get(train_cfg, "noise_snr_min_db", 10.0))
+    )
+    noise_snr_max_db = (
+        args.noise_snr_max_db
+        if args.noise_snr_max_db is not None
+        else float(cfg_get(train_cfg, "noise_snr_max_db", 30.0))
+    )
+    noise_augmented_main_weight = (
+        args.noise_augmented_main_weight
+        if args.noise_augmented_main_weight is not None
+        else float(cfg_get(train_cfg, "noise_augmented_main_weight", 0.0))
+    )
+    noise_delay_consistency_weight = (
+        args.noise_delay_consistency_weight
+        if args.noise_delay_consistency_weight is not None
+        else float(cfg_get(train_cfg, "noise_delay_consistency_weight", 0.0))
+    )
+    noise_delay_spread_supervised_weight = (
+        args.noise_delay_spread_supervised_weight
+        if args.noise_delay_spread_supervised_weight is not None
+        else float(
+            cfg_get(train_cfg, "noise_delay_spread_supervised_weight", 0.0)
+        )
+    )
+    noise_delay_spread_consistency_weight = (
+        args.noise_delay_spread_consistency_weight
+        if args.noise_delay_spread_consistency_weight is not None
+        else float(
+            cfg_get(train_cfg, "noise_delay_spread_consistency_weight", 0.0)
+        )
+    )
+    noise_k_consistency_weight = (
+        args.noise_k_consistency_weight
+        if args.noise_k_consistency_weight is not None
+        else float(cfg_get(train_cfg, "noise_k_consistency_weight", 0.0))
+    )
+    noise_clean_k_supervised_weight = (
+        args.noise_clean_k_supervised_weight
+        if args.noise_clean_k_supervised_weight is not None
+        else float(cfg_get(train_cfg, "noise_clean_k_supervised_weight", 0.0))
+    )
+    noise_noisy_k_supervised_weight = (
+        args.noise_noisy_k_supervised_weight
+        if args.noise_noisy_k_supervised_weight is not None
+        else float(cfg_get(train_cfg, "noise_noisy_k_supervised_weight", 0.0))
+    )
+    if not 0.0 <= noise_augmentation_probability <= 1.0:
+        raise ValueError("--noise-augmentation-probability must be in [0, 1].")
+    if noise_snr_min_db > noise_snr_max_db:
+        raise ValueError("--noise-snr-min-db must not exceed --noise-snr-max-db.")
+    if not all(
+        math.isfinite(value)
+        for value in (noise_snr_min_db, noise_snr_max_db)
+    ):
+        raise ValueError("Noise SNR bounds must be finite.")
+    if min(
+        noise_augmented_main_weight,
+        noise_delay_consistency_weight,
+        noise_delay_spread_supervised_weight,
+        noise_delay_spread_consistency_weight,
+        noise_k_consistency_weight,
+        noise_clean_k_supervised_weight,
+        noise_noisy_k_supervised_weight,
+    ) < 0.0:
+        raise ValueError("Noise-augmentation loss weights must be non-negative.")
     min_class_size = (
         args.min_class_size
         if args.min_class_size is not None
@@ -1431,10 +4314,44 @@ def main() -> None:
     )
     if limit_samples_per_attribute_value is not None:
         limit_samples_per_attribute_value = int(limit_samples_per_attribute_value)
+    max_delay_spread_ns = (
+        args.max_delay_spread_ns
+        if args.max_delay_spread_ns is not None
+        else cfg_get(train_cfg, "max_delay_spread_ns", None)
+    )
+    if max_delay_spread_ns is not None:
+        max_delay_spread_ns = float(max_delay_spread_ns)
     freeze_csi = bool(args.freeze_csi or cfg_get(train_cfg, "freeze_csi", False))
-    freeze_text_prototypes = bool(
-        args.freeze_text_prototypes
-        or cfg_get(train_cfg, "freeze_text_prototypes", False)
+    requested_semantic_anchor_mode = args.semantic_anchor_mode
+    if requested_semantic_anchor_mode is None and args.freeze_text_prototypes:
+        requested_semantic_anchor_mode = "fixed"
+    if requested_semantic_anchor_mode is None:
+        requested_semantic_anchor_mode = train_cfg.get("semantic_anchor_mode")
+    if requested_semantic_anchor_mode is not None:
+        freeze_text_encoder, freeze_prototypes = semantic_anchor_freeze_policy(
+            str(requested_semantic_anchor_mode)
+        )
+    else:
+        legacy_freeze_text_prototypes = bool(
+            cfg_get(train_cfg, "freeze_text_prototypes", False)
+        )
+        freeze_text_encoder = bool(
+            cfg_get(
+                train_cfg,
+                "freeze_text_encoder",
+                legacy_freeze_text_prototypes,
+            )
+        )
+        freeze_prototypes = bool(
+            cfg_get(
+                train_cfg,
+                "freeze_prototypes",
+                legacy_freeze_text_prototypes,
+            )
+        )
+    semantic_anchor_mode = infer_semantic_anchor_mode(
+        freeze_text_encoder,
+        freeze_prototypes,
     )
     output_dir = args.output_dir if args.output_dir is not None else str(cfg_get(train_cfg, "output_dir", "artifacts/pretrain_csi_clip"))
     save_every = args.save_every if args.save_every is not None else int(cfg_get(train_cfg, "save_every", 1))
@@ -1445,6 +4362,8 @@ def main() -> None:
             device,
             text_mode=text_mode,
             csi_to_text_weight=csi_to_text_weight,
+            prototype_weight=prototype_weight,
+            text_prototype_weight=text_prototype_weight,
             semantic_classifier_weight=semantic_classifier_weight,
             semantic_classifier_class_weight=semantic_classifier_class_weight,
             semantic_classifier_logit_adjustment=semantic_classifier_logit_adjustment,
@@ -1454,18 +4373,108 @@ def main() -> None:
             attribute_classifier_class_weight=attribute_classifier_class_weight,
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
+            first_path_aod_weight=first_path_aod_weight,
+            first_path_aod_nlos_weight=first_path_aod_nlos_weight,
             aux_regression_targets=aux_regression_targets,
+            k_factor_loss_weights=k_factor_loss_weights,
+            strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+            strong_k_position_weight=strong_k_position_weight,
+            strong_k_bin_weights=strong_k_bin_weights,
+            first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+            first_path_power_bin_position_weight=first_path_power_bin_position_weight,
+            direct_power_weight=direct_power_weight,
+            first_path_power_gate_mode=first_path_power_gate_mode,
+            first_path_power_mode=first_path_power_mode,
+            first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+            nlos_enhanced_power_loss=nlos_enhanced_power_loss,
+            first_path_power_delta_limit=first_path_power_delta_limit,
+            delay_spread_weight=delay_spread_weight,
+            delay_spread_raw_weight=delay_spread_raw_weight,
+            delay_spread_raw_beta_ns=delay_spread_raw_beta_ns,
+            first_path_delay_weight=first_path_delay_weight,
+            first_path_delay_raw_weight=first_path_delay_raw_weight,
+            first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
+            first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
+            first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
+            first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
+            first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
+            first_path_delay_bin_weights=first_path_delay_bin_weights,
+            estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+            estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+            estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+            first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
+            los_delay_weight=los_delay_weight,
+            los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+            use_physics_calibration_loss=use_physics_calibration_loss,
+            los_delay_consistency_weight=los_delay_consistency_weight,
+            los_angle_weight=los_angle_weight,
+            first_path_angle_weight=first_path_angle_weight,
+            first_path_angle_nlos_weight=first_path_angle_nlos_weight,
+            delay_spread_teacher_weight=delay_spread_teacher_weight,
+            delay_spread_bin_weights=delay_spread_bin_weights,
+            delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+            delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+            delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+            interaction_count_classifier_weight=interaction_count_classifier_weight,
+            interaction_count_regression_weight=interaction_count_regression_weight,
+            reflection_count_classifier_weight=reflection_count_classifier_weight,
+            reflection_count_regression_weight=reflection_count_regression_weight,
+            reflection_path_count_regression_weight=reflection_path_count_regression_weight,
+            reflection_count_nlos_weight=reflection_count_nlos_weight,
+            interaction_count_soft_labels=interaction_count_soft_labels,
+            physics_relational_weight=physics_relational_weight,
+            interaction_count_fields=interaction_count_fields,
+            first_path_power_bin_weights=first_path_power_bin_weights,
+            first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
             semantic_key_mode=semantic_key_mode,
+            token_norm_mode=token_norm_mode,
+            use_power_branch=use_power_branch,
+            detach_delay_spread_features=detach_delay_spread_features,
+            detach_first_path_delay_features=detach_first_path_delay_features,
+            use_delay_specific_encoder=use_delay_specific_encoder,
+            use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+            use_continuous_config_encoding=use_continuous_config_encoding,
+            array_token_dropout=array_token_dropout,
+            array_token_min_tokens=array_token_min_tokens,
+            use_los_angle_context_encoder=use_los_angle_context_encoder,
+            use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+            use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+            use_shared_physics_token=use_shared_physics_token,
+            shared_physics_token_residual_scale=shared_physics_token_residual_scale,
+            noise_augmentation_enabled=noise_augmentation_enabled,
+            noise_augmentation_probability=noise_augmentation_probability,
+            noise_snr_min_db=noise_snr_min_db,
+            noise_snr_max_db=noise_snr_max_db,
+            noise_augmented_main_weight=noise_augmented_main_weight,
+            noise_delay_consistency_weight=noise_delay_consistency_weight,
+            noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+            noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
+            noise_k_consistency_weight=noise_k_consistency_weight,
+            noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+            noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
         )
         return
 
     data_path = args.data_path if args.data_path is not None else train_cfg.get("data_path")
+    configured_additional_paths = cfg_get(
+        train_cfg,
+        "additional_data_paths",
+        (),
+    )
+    if isinstance(configured_additional_paths, str):
+        configured_additional_paths = (configured_additional_paths,)
+    additional_data_paths = tuple(
+        args.additional_data_path
+        if args.additional_data_path is not None
+        else configured_additional_paths
+    )
     if data_path:
         run_real_pretrain(
             data_path=data_path,
+            additional_data_paths=additional_data_paths,
             checkpoint_path=checkpoint_path,
             device=device,
             epochs=epochs,
@@ -1474,6 +4483,20 @@ def main() -> None:
             weight_decay=weight_decay,
             batch_size=batch_size,
             temperature=temperature,
+            token_norm_mode=token_norm_mode,
+            use_power_branch=use_power_branch,
+            detach_delay_spread_features=detach_delay_spread_features,
+            detach_first_path_delay_features=detach_first_path_delay_features,
+            use_delay_specific_encoder=use_delay_specific_encoder,
+            use_array_invariant_delay_encoder=use_array_invariant_delay_encoder,
+            use_continuous_config_encoding=use_continuous_config_encoding,
+            array_token_dropout=array_token_dropout,
+            array_token_min_tokens=array_token_min_tokens,
+            use_los_angle_context_encoder=use_los_angle_context_encoder,
+            use_first_path_angle_context_encoder=use_first_path_angle_context_encoder,
+            use_first_path_aod_context_encoder=use_first_path_aod_context_encoder,
+            use_shared_physics_token=use_shared_physics_token,
+            shared_physics_token_residual_scale=shared_physics_token_residual_scale,
             warmup_epochs=warmup_epochs,
             min_lr=min_lr,
             csi_to_text_weight=csi_to_text_weight,
@@ -1489,10 +4512,73 @@ def main() -> None:
             attribute_classifier_class_weight=attribute_classifier_class_weight,
             attribute_classifier_logit_adjustment=attribute_classifier_logit_adjustment,
             aux_regression_weight=aux_regression_weight,
+            first_path_aod_weight=first_path_aod_weight,
+            first_path_aod_nlos_weight=first_path_aod_nlos_weight,
             aux_regression_targets=aux_regression_targets,
+            k_factor_loss_weights=k_factor_loss_weights,
+            strong_k_bin_classifier_weight=strong_k_bin_classifier_weight,
+            strong_k_position_weight=strong_k_position_weight,
+            strong_k_bin_weights=strong_k_bin_weights,
+            first_path_power_bin_classifier_weight=first_path_power_bin_classifier_weight,
+            first_path_power_bin_position_weight=first_path_power_bin_position_weight,
+            direct_power_weight=direct_power_weight,
+            first_path_power_gate_mode=first_path_power_gate_mode,
+            first_path_power_mode=first_path_power_mode,
+            first_path_power_use_internal_gate=first_path_power_use_internal_gate,
+            nlos_enhanced_power_loss=nlos_enhanced_power_loss,
+            first_path_power_delta_limit=first_path_power_delta_limit,
+            delay_spread_weight=delay_spread_weight,
+            delay_spread_raw_weight=delay_spread_raw_weight,
+            delay_spread_raw_beta_ns=delay_spread_raw_beta_ns,
+            first_path_delay_weight=first_path_delay_weight,
+            first_path_delay_raw_weight=first_path_delay_raw_weight,
+            first_path_delay_fused_raw_weight=first_path_delay_fused_raw_weight,
+            first_path_delay_raw_beta_ns=first_path_delay_raw_beta_ns,
+            first_path_delay_bin_classifier_weight=first_path_delay_bin_classifier_weight,
+            first_path_delay_bin_position_weight=first_path_delay_bin_position_weight,
+            first_path_delay_bin_consistency_weight=first_path_delay_bin_consistency_weight,
+            first_path_delay_bin_weights=first_path_delay_bin_weights,
+            estimated_pdp_tail_bin_weight=estimated_pdp_tail_bin_weight,
+            estimated_pdp_tail_labels=estimated_pdp_tail_labels,
+            estimated_pdp_tail_gate_mode=estimated_pdp_tail_gate_mode,
+            first_path_delay_tail_underestimate_weight=first_path_delay_tail_underestimate_weight,
+            los_delay_weight=los_delay_weight,
+            los_delay_nonnegative_weight=los_delay_nonnegative_weight,
+            use_physics_calibration_loss=use_physics_calibration_loss,
+            los_delay_consistency_weight=los_delay_consistency_weight,
+            los_angle_weight=los_angle_weight,
+            first_path_angle_weight=first_path_angle_weight,
+            first_path_angle_nlos_weight=first_path_angle_nlos_weight,
+            delay_spread_teacher_weight=delay_spread_teacher_weight,
+            delay_spread_bin_weights=delay_spread_bin_weights,
+            delay_spread_bin_classifier_weight=delay_spread_bin_classifier_weight,
+            delay_spread_bin_position_weight=delay_spread_bin_position_weight,
+            delay_spread_tail_classifier_weight=delay_spread_tail_classifier_weight,
+            interaction_count_classifier_weight=interaction_count_classifier_weight,
+            interaction_count_regression_weight=interaction_count_regression_weight,
+            reflection_count_classifier_weight=reflection_count_classifier_weight,
+            reflection_count_regression_weight=reflection_count_regression_weight,
+            reflection_path_count_regression_weight=reflection_path_count_regression_weight,
+            reflection_count_nlos_weight=reflection_count_nlos_weight,
+            interaction_count_soft_labels=interaction_count_soft_labels,
+            physics_relational_weight=physics_relational_weight,
+            interaction_count_fields=interaction_count_fields,
+            first_path_power_bin_weights=first_path_power_bin_weights,
+            first_path_power_nlos_weight=first_path_power_nlos_weight,
             multipositive_distance_threshold=multipositive_distance_threshold,
             multipositive_positive_mode=multipositive_positive_mode,
             min_class_size_for_multipositive=min_class_size_for_multipositive,
+            noise_augmentation_enabled=noise_augmentation_enabled,
+            noise_augmentation_probability=noise_augmentation_probability,
+            noise_snr_min_db=noise_snr_min_db,
+            noise_snr_max_db=noise_snr_max_db,
+            noise_augmented_main_weight=noise_augmented_main_weight,
+            noise_delay_consistency_weight=noise_delay_consistency_weight,
+            noise_delay_spread_supervised_weight=noise_delay_spread_supervised_weight,
+            noise_delay_spread_consistency_weight=noise_delay_spread_consistency_weight,
+            noise_k_consistency_weight=noise_k_consistency_weight,
+            noise_clean_k_supervised_weight=noise_clean_k_supervised_weight,
+            noise_noisy_k_supervised_weight=noise_noisy_k_supervised_weight,
             min_class_size=min_class_size,
             semantic_key_mode=semantic_key_mode,
             attribute_remap=attribute_remap,
@@ -1500,8 +4586,13 @@ def main() -> None:
             limit_samples=limit_samples,
             limit_samples_by_attribute=limit_samples_by_attribute,
             limit_samples_per_attribute_value=limit_samples_per_attribute_value,
+            max_delay_spread_ns=max_delay_spread_ns,
+            allow_prototype_mismatch_transfer=args.allow_prototype_mismatch_transfer,
             freeze_csi=freeze_csi,
-            freeze_text_prototypes=freeze_text_prototypes,
+            freeze_text_encoder=freeze_text_encoder,
+            freeze_prototypes=freeze_prototypes,
+            semantic_anchor_mode=semantic_anchor_mode,
+            seed=seed,
             output_dir=output_dir,
             save_every=save_every,
         )
