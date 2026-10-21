@@ -202,4 +202,6 @@ Citation metadata will be provided in `CITATION.cff` before the public `v1.0.0` 
 
 ## License
 
-License information will be provided in the root `LICENSE` file before the public release.
+No open-source license is currently granted for this repository. Unless otherwise stated, all rights are reserved.
+
+The source code may be viewed for academic reference. Copying, modification, redistribution, commercial use, or incorporation into other projects requires prior written permission from the copyright holder(s).

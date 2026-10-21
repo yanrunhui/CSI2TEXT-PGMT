@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use CSI2TEXT-PGMT in your research, please cite this software."
+title: "CSI2TEXT-PGMT"
+type: software
+authors:
+  - family-names: "Yan"
+    given-names: "Runhui"
+repository-code: "https://github.com/yanrunhui/CSI_clip_model"
+keywords:
+  - channel state information
+  - CSI representation learning
+  - wireless communications
+  - multimodal learning
+  - physics-grounded learning
