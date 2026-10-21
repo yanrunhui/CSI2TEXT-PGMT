@@ -41,10 +41,17 @@ from downstream_localization.pretrained import (  # noqa: E402
 )
 
 
-MODEL_NAMES = ("scratch", "scratch_physics", "full_embedding", "full_physics")
+MODEL_NAMES = (
+    "scratch",
+    "scratch_physics",
+    "pretrained_finetune",
+    "full_embedding",
+    "full_physics",
+)
 DISPLAY_NAMES = {
     "scratch": "From scratch",
     "scratch_physics": "Scratch + frozen physics",
+    "pretrained_finetune": "Pretrained encoder fine-tuned",
     "full_embedding": "Full embedding",
     "full_physics": "Full embedding + physics",
 }
@@ -188,6 +195,10 @@ def localization_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict
         "mean_m": float(np.mean(error)),
         "median_m": float(np.median(error)),
         "p90_m": float(np.percentile(error, 90)),
+        "within_0.1m_pct": float(100.0 * np.mean(error <= 0.1)),
+        "within_0.25m_pct": float(100.0 * np.mean(error <= 0.25)),
+        "within_0.5m_pct": float(100.0 * np.mean(error <= 0.5)),
+        "within_1m_pct": float(100.0 * np.mean(error <= 1.0)),
         "within_5m_pct": float(100.0 * np.mean(error <= 5.0)),
         "within_10m_pct": float(100.0 * np.mean(error <= 10.0)),
     }
@@ -195,6 +206,40 @@ def localization_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict
 
 def cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
+def csi_encoder_state_dict(pretrained_model: nn.Module) -> dict[str, torch.Tensor]:
+    encoder = getattr(pretrained_model, "csi", None)
+    if encoder is None:
+        raise ValueError("Pretrained model does not expose a CSI encoder as .csi")
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in encoder.state_dict().items()
+    }
+
+
+def load_initial_encoder_state(
+    model: ScratchLocalizationModel,
+    initial_encoder_state: dict[str, torch.Tensor] | None,
+) -> int:
+    if initial_encoder_state is None:
+        return 0
+    current = model.encoder.state_dict()
+    compatible = {
+        key: value
+        for key, value in initial_encoder_state.items()
+        if key in current and current[key].shape == value.shape
+    }
+    if len(compatible) != len(current):
+        missing = sorted(set(current) - set(compatible))
+        skipped = sorted(set(initial_encoder_state) - set(compatible))
+        raise ValueError(
+            "Pretrained CSI encoder is incompatible with localization encoder; "
+            f"loaded={len(compatible)} expected={len(current)} "
+            f"missing={missing[:5]} skipped={skipped[:5]}"
+        )
+    model.encoder.load_state_dict(compatible, strict=True)
+    return len(compatible)
 
 
 @torch.inference_mode()
@@ -234,6 +279,7 @@ def train_scratch(
     device: torch.device,
     physics_features: torch.Tensor | None = None,
     train_indices: torch.Tensor | None = None,
+    initial_encoder_state: dict[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     seed_everything(args.seed)
     if physics_features is not None and physics_features.shape != (len(corpus.samples), 4):
@@ -247,6 +293,14 @@ def train_scratch(
         model_info["use_continuous_config_encoding"],
         physics_dim=0 if physics_features is None else 4,
     ).to(device)
+    initialized_encoder_tensors = load_initial_encoder_state(
+        model, initial_encoder_state
+    )
+    if initialized_encoder_tensors:
+        print(
+            f"{name} initialized CSI encoder from checkpoint "
+            f"({initialized_encoder_tensors} tensors)"
+        )
     effective_train_indices = (
         corpus.split_indices["train"]
         if train_indices is None
@@ -325,6 +379,10 @@ def train_scratch(
             "best_val_median_m": best_median,
             "history": history,
             "uses_frozen_physics": physics_features is not None,
+            "initial_encoder": (
+                "pretrained" if initial_encoder_state is not None else "random"
+            ),
+            "fine_tunes_encoder": True,
             "physics_order": (
                 ["p_los", "first_path_delay_ns/3000", "sin_aoa", "cos_aoa"]
                 if physics_features is not None
@@ -578,6 +636,17 @@ def main() -> None:
     if "scratch" in selected:
         results["scratch"] = train_scratch(
             "scratch", corpus, normalizer, model_info, args, device
+        )
+
+    if "pretrained_finetune" in selected:
+        results["pretrained_finetune"] = train_scratch(
+            "pretrained_finetune",
+            corpus,
+            normalizer,
+            model_info,
+            args,
+            device,
+            initial_encoder_state=csi_encoder_state_dict(pretrained_model),
         )
 
     if any(

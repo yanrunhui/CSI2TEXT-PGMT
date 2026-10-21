@@ -243,15 +243,16 @@ def main() -> None:
     end_label(ax_left, "Text factuality", left["Text factuality"], "Factuality  0.7%", dy=1)
     end_label(ax_left, "LoS/NLoS accuracy", left["LoS/NLoS accuracy"], "LoS/NLoS  -0.2%", dy=-3)
     ax_left.text(
-        0.98,
-        0.96,
+        0.50,
+        1.01,
         "Task-level degradation remains <8%",
         transform=ax_left.transAxes,
-        ha="right",
-        va="top",
-        fontsize=6.5,
-        color=SERIES["Numeric accuracy"]["color"],
+        ha="center",
+        va="bottom",
+        fontsize=7.0,
+        color="#C43C39",
         fontweight="bold",
+        clip_on=False,
     )
     k_peak_index = int(np.argmax(left["K-factor MAE"]))
     ax_left.annotate(
@@ -320,9 +321,36 @@ def main() -> None:
             fontweight="bold",
             color=SERIES["First-path delay MAE"]["color"],
         )
+    ax_right.annotate(
+        "",
+        xy=(0.47, 0.54),
+        xytext=(0.34, 0.66),
+        xycoords=ax_right.transAxes,
+        textcoords=ax_right.transAxes,
+        arrowprops={
+            "arrowstyle": "-|>",
+            "color": SERIES["First-path delay MAE"]["color"],
+            "linewidth": 1.8,
+            "mutation_scale": 15,
+            "shrinkA": 0,
+            "shrinkB": 0,
+        },
+        annotation_clip=False,
+        zorder=6,
+    )
+    ax_right.plot(
+        [0.25, 0.25],
+        [0.37, 0.53],
+        transform=ax_right.transAxes,
+        color="#777777",
+        linewidth=1.15,
+        solid_capstyle="butt",
+        clip_on=False,
+        zorder=5,
+    )
     ax_right.text(
-        0.03,
-        0.96,
+        0.29,
+        0.48,
         "Delay dominates\n100.8–160.7% degradation",
         transform=ax_right.transAxes,
         ha="left",

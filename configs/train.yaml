@@ -1,4 +1,4 @@
-train:
+ train:
   data_path: artifacts/d2los_30k_los_nlos_balanced_los_angle_train.pt
   eval_data_path: artifacts/d2los_30k_los_nlos_balanced_los_angle_test.pt
   output_dir: artifacts/pretrain_d2los_30k_los_nlos_balanced_los_angle

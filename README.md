@@ -52,3 +52,24 @@ python scripts/diagnose_path_distribution.py \
 ## Layout
 
 See the folder structure in the accompanying design document for the intended expansion path.
+
+## Qualitative CSI-to-Text examples
+
+After producing aligned `signal_descriptions.pt` payloads for the proposed model and a direct-LLM
+baseline, export the three paper cases with:
+
+```bash
+python scripts/export_qualitative_channel_reports.py \
+  --ours artifacts/ours/evaluation/signal_descriptions.pt \
+  --direct-llm InternLM3-8B=artifacts/internlm3_8b_csi_prefix/seed_0/evaluation/signal_descriptions.pt \
+  --output-dir artifacts/qualitative_channel_reports
+```
+
+The script intersects the payloads by sample index and verifies that every aligned target record is
+identical, so a full-cohort proposed-model payload can be compared safely with a shorter direct-LLM
+subset. It then deterministically selects a typical LoS case, a complex NLoS case, and a challenging
+case. It audits both the structured records and values actually stated in the reports. The output
+directory contains JSON and CSV audit data, a Markdown preview, and a double-column LaTeX table that
+can be included in the paper with `\input{qualitative_channel_reports.tex}`. Field tolerances default
+to those used by `evaluate_signal_descriptions.py` and can be overridden with the generated
+`--tolerance-*` options.

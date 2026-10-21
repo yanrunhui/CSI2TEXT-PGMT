@@ -1,17 +1,19 @@
 # CSI2TEXT-PGMT 下游二维定位实验
 
-这个目录是独立的定位实验，不会向仓库原有的 `scripts/`、`data/`、`models/` 写入任何文件。它复用原项目的 CSI encoder 和 D2Los 预处理定义，完成以下四个模型的公平比较：
+这个目录是独立的定位实验，不会向仓库原有的 `scripts/`、`data/`、`models/` 写入任何文件。它复用原项目的 CSI encoder 和 D2Los 预处理定义，完成以下模型的公平比较：
 
 1. `scratch`：随机初始化 CSI encoder，与定位头一起端到端训练；
 2. `scratch_physics`：训练随机初始化的 CSI encoder，同时拼接 Full 模型冻结预测的四维物理特征；
-3. `full_embedding`：冻结预训练 CSI2TEXT-PGMT，仅使用 256 维 CSI embedding；
-4. `full_physics`：冻结预训练模型，使用 256 维 embedding，加预测的 LoS 概率、首径时延、首径角度正余弦，共 260 维。
+3. `pretrained_finetune`：用预训练 CSI encoder 初始化，然后和定位头一起端到端微调；
+4. `full_embedding`：冻结预训练 CSI2TEXT-PGMT，仅使用 256 维 CSI embedding；
+5. `full_physics`：冻结预训练模型，使用 256 维 embedding，加预测的 LoS 概率、首径时延、首径角度正余弦，共 260 维。
 
 物理特征全部来自模型预测，不使用真实 LoS、真实时延或真实角度。定位标签是 `(RX_x - TX_x, RX_y - TX_y)`，坐标归一化统计量只由训练集计算。
 
 ## 文件说明
 
 - `prepare_data.py`：从 RayVerse `.propbin.gz` 流式生成 CSI token、TX/RX 坐标和固定划分；
+- `prepare_ultra_dense.py`：从 KU Leuven ultra-dense `.npy` 实测 CSI 生成定位迁移验证数据；
 - `convert_existing.py`：给已有预处理 train/val/test CSI 回填坐标，不重新生成 CSI；
 - `data_io.py`：定位数据集和 batch 拼接；
 - `pretrained.py`：从 checkpoint 自动还原 CSI2TEXT-PGMT，并提取 embedding/物理预测；
@@ -19,6 +21,7 @@
 - `run_label_efficiency.py`：用嵌套的 1%/5%/10%/25%/100% 位置标签比较 Scratch 与 Scratch + Frozen Physics。
 - `diagnose_test_errors.py`：读取已有测试预测，按 LoS/NLoS 分组统计并列出最大误差链路。
 - `run_llm_baseline.py`：用 DeepSeek-Qwen3-8B、InternLM3-8B 和 Qwen3.5-2B 做连续 CSI soft-prefix 定位 baseline。
+- `run_classical_agreement.py`：第二层实测验证；用 IFFT-PDP / raw CSI energy 作为独立经典估计器，检查模型物理输出的一致性。
 
 ## 1. 准备 100k 定位数据
 
@@ -117,6 +120,119 @@ python -m downstream_localization.run_experiment \
 - `frozen_features.pt`：冻结 Full 模型提取的 256 维 embedding 和四维预测物理特征。
 
 首径时延在送入定位头前除以 3000 ns，与 CSI2TEXT-PGMT 内部物理目标尺度一致；预测角度向量会归一化为单位 `(sin, cos)`。
+
+### 用 KU Leuven ultra-dense 实测数据做第一层验证
+
+这个实验只使用真实可标定的用户位置 GT，回答的是：
+
+```text
+DeepMIMO 上预训练出的 CSI 表示，迁移到真实 measured CSI 后，是否能提升定位？
+```
+
+如果需要 LoS/nLoS 数量严格平衡，推荐直接生成一个 combined corpus。下面命令会生成 50k 样本：train 40k，其中 LoS 20k、nLoS 20k；val 5k，其中 LoS 2.5k、nLoS 2.5k；test 5k，其中 LoS 2.5k、nLoS 2.5k。脚本会自动读取 `user_positions.npy`、`antenna_positions.npy` 和真实存在的 `samples/channel_measurement_*.npy`，跳过缺失 CSI 文件。
+
+抽样不是简单连续取样：`--split-tile-size-m 0.25` 让 train/val/test 使用互不重叠的粗空间 tile，`--sample-cell-size-m 0.01` 让每个类别在 1 cm 小格内最多取一个样本，并且默认不让同一 split 里的 LoS/nLoS 共用同一个 1 cm 小格，避免 5 mm 超密网格里抽到一堆几乎同位置的点。
+
+```bash
+python -m downstream_localization.prepare_ultra_dense_balanced \
+  --los-data-root /home/yrh/CSI_model/CSI_model/deepmimo_scenarios/ultra_dense/URA_lab_LoS \
+  --nlos-data-root /home/yrh/CSI_model/CSI_model/deepmimo_scenarios/ultra_dense/URA_lab_nLoS \
+  --output downstream_localization/artifacts/ultra_dense_ura_lab_los_nlos_balanced_40k_5k_5k.pt \
+  --train-per-class 20000 \
+  --val-per-class 2500 \
+  --test-per-class 2500 \
+  --split-tile-size-m 0.25 \
+  --sample-cell-size-m 0.01 \
+  --carrier-hz 2.61e9 \
+  --bandwidth-hz 20e6 \
+  --target-nf 100 \
+  --seed 23421
+```
+
+然后跑四组方法：
+
+```bash
+python -m downstream_localization.run_experiment \
+  --data downstream_localization/artifacts/ultra_dense_ura_lab_los_nlos_balanced_40k_5k_5k.pt \
+  --checkpoint /path/to/full_csi2text_pgmt_checkpoint.pt \
+  --output-dir downstream_localization/outputs/ultra_dense_balanced_first_layer \
+  --models all \
+  --batch-size 128 \
+  --epochs 50 \
+  --patience 8 \
+  --head-lr 1e-3 \
+  --scratch-lr 3e-4 \
+  --seed 23421
+```
+
+对应四个方法就是表里的：
+
+| 表中名字 | 命令里的模型名 |
+|---|---|
+| Scratch + frozen physics | `scratch_physics` |
+| Scratch | `scratch` |
+| Pretrained finetune | `pretrained_finetune` |
+| Pretrained embedding | `full_embedding` |
+| Pretrained embedding + physics | `full_physics` |
+
+注意这里的实测数据是 uplink 单发多收，脚本按 TDD 互易性的方式把 64 根接收天线当成模型的 8×8 空间阵列输入。输出指标除了 Mean/Median/P90，还会报告 `≤0.1m`、`≤0.25m`、`≤0.5m`、`≤1m`，更适合这个超密定位场景。
+
+### 第三层：实测物理一致性验证
+
+没有 path-level GT 时，不把模型输出叫 accuracy，而是验证它是否符合真实信道的物理趋势。下面脚本会在实测 test split 上输出：
+
+- LoS/NLoS 的 `p_LoS`、K-factor、delay spread、power 分布；
+- LoS 场景下 first-path delay vs distance 的线性斜率，和 `1/c = 3.336 ns/m` 对比；
+- LoS 场景下 predicted power / CSI energy vs `log10(distance)` 的路径损耗趋势；
+- 空间一致性曲线：位置越远，embedding/物理预测差异是否越大。
+
+```bash
+python -m downstream_localization.run_physical_consistency \
+  --data downstream_localization/artifacts/ultra_dense_ura_lab_los_nlos_balanced_40k_5k_5k.pt \
+  --checkpoint /home/yrh/CSI_model/CSI_model/artifacts/pretrain_d2los_50k_upa8x8_bw100m_nf128_total_power_seed0/checkpoint_last.pt \
+  --output-dir downstream_localization/outputs/ultra_dense_physical_consistency_test \
+  --splits test \
+  --batch-size 256 \
+  --pair-count 200000 \
+  --seed 23421
+```
+
+主要输出：
+
+- `physical_consistency_metrics.json`：回归斜率、相关性、LoS/NLoS 分布差异、空间一致性相关性；
+- `los_nlos_distribution_summary.csv`：LoS/NLoS 分组统计；
+- `spatial_consistency_bins.csv`：不同空间距离 bin 下的预测差异；
+- `physical_consistency_summary.png`：delay-distance、power-distance、K-factor、delay spread 四联图；
+- `spatial_consistency.png`：空间一致性曲线。
+
+### 第二层：与经典 PDP 估计器的一致性
+
+这个实验不需要 path-level GT，也不要写成 accuracy。它比较的是：
+
+- 模型 `first_delay_ns` vs IFFT-PDP 的 first delay，只建议报告 Pearson/Spearman correlation；
+- 模型 `delay_spread_ns` vs PDP RMS delay spread；
+- 模型 `k_factor_db` vs PDP dominant peak-to-tail ratio；
+- 模型 power head vs raw CSI energy。
+
+```bash
+python -m downstream_localization.run_classical_agreement \
+  --data downstream_localization/artifacts/ultra_dense_ura_lab_los_nlos_balanced_40k_5k_5k.pt \
+  --checkpoint /home/yrh/CSI_model/CSI_model/artifacts/pretrain_d2los_50k_upa8x8_bw100m_nf128_total_power_seed0/checkpoint_last.pt \
+  --output-dir downstream_localization/outputs/ultra_dense_classical_agreement_test \
+  --splits test \
+  --batch-size 256 \
+  --n-fft-factor 4 \
+  --pdp-threshold-db 20 \
+  --max-delay-ns 3000 \
+  --seed 23421
+```
+
+主要输出：
+
+- `classical_agreement_metrics.json`：整体、LoS、nLoS 三组的一致性指标；
+- `classical_agreement_summary.csv`：便于直接整理成表格的扁平版指标；
+- `classical_agreement_predictions.npz`：逐样本模型输出和经典 PDP 估计；
+- `classical_agreement_scatter.png`：四联散点图。
 
 ## 3. 标签效率实验
 
