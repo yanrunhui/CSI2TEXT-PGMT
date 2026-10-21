@@ -1,7 +1,10 @@
-# Install in a separate environment from the main CSI training environment.
-# Qwen3.5 support landed in the Transformers 5.x line.
+# Install in a separate GPU environment from InternLM3.
+-r requirements.txt
+
 transformers>=5.6.2,<6
-accelerate>=1.2
-peft>=0.15
-bitsandbytes>=0.45
+accelerate>=1.2,<2
+peft>=0.15,<1
+bitsandbytes>=0.45,<1
 safetensors>=0.4
+torchvision
+Pillow

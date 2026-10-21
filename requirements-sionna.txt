@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# MCS link-level simulation; install in a dedicated Python 3.11 environment.
+sionna>=2,<3

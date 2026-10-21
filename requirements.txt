@@ -1,19 +1,7 @@
-# Core environment for CSI train/evaluate experiments
-# Install the torch build that matches your CUDA/CPU environment.
+# Core CSI2TEXT-PGMT environment.
+# Python 3.10 or 3.11 is recommended.
+# Install the PyTorch build appropriate for the target CPU/CUDA platform.
 torch
 numpy
 scipy
-matplotlib
-pyyaml
-
-# Optional utilities used by the bundled OpenCLIP training code
-torchvision
-pandas
-Pillow
-tqdm
-regex
-ftfy
-braceexpand
-webdataset
-fsspec
-timm
+PyYAML

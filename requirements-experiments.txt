@@ -1,0 +1,11 @@
+-r requirements.txt
+
+# Plotting and result processing
+matplotlib
+pandas
+h5py
+Pillow
+
+# Optional paper table/PDF utilities
+reportlab
+pdf2image
